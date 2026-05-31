@@ -22,6 +22,7 @@ import scipy.stats.distributions as sp
 
 
 # test support imports from pymc
+from pymc.logprob.utils import ParameterValueError
 from pymc.testing import (
     BaseTestDistributionRandom,
     Domain,
@@ -40,16 +41,17 @@ from scipy import stats
 # the distributions to be tested
 from pymc_extras.distributions import Chi, ExtGenPareto, GenExtreme, GenPareto, Maxwell
 
-pytestmark = [
-    pytest.mark.filterwarnings(
-        "ignore:Numba will use object mode to run Generalized Extreme Value:UserWarning"
-    ),
-    # The Generalized Pareto family legitimately evaluates to +/-inf at the
-    # (measure-zero) support boundary and at probabilities 0/1; NumPy flags those
-    # as divide-by-zero / invalid / overflow. They are the correct boundary
-    # values (the numerical comparisons still validate them), so silence the FPE
-    # warnings the repo-wide ``filterwarnings = error`` would otherwise promote
-    # to test errors.
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:Numba will use object mode to run Generalized Extreme Value:UserWarning"
+)
+
+# The Generalized Pareto family legitimately evaluates to +/-inf at the
+# (measure-zero) support boundary and at probabilities 0 / 1; NumPy flags those
+# as divide-by-zero / invalid / overflow during ``.eval()``. They are the correct
+# boundary values (the numerical comparisons still validate them). Scope the FPE
+# silencing to the GPD test classes (via their ``pytestmark``) rather than muting
+# the whole module, which also holds the GenExtreme / Chi / Maxwell tests.
+_GPD_FPE_FILTERS = [
     pytest.mark.filterwarnings("ignore:divide by zero encountered:RuntimeWarning"),
     pytest.mark.filterwarnings("ignore:invalid value encountered:RuntimeWarning"),
     pytest.mark.filterwarnings("ignore:overflow encountered:RuntimeWarning"),
@@ -204,14 +206,27 @@ class TestMaxwell:
         )
 
 
-# Shape grid spanning the exponential limit (xi = 0) and both tails. The first
-# and last entries are treated as domain edges by the pymc test harness.
-XI_DOMAIN = Domain([-1, -0.5, -0.1, 0, 0.1, 0.5, 1], dtype="float64")
-KAPPA_DOMAIN = Domain([0.25, 0.5, 1, 2, 5], dtype="float64")
-# ``check_icdf`` compares absolute values, so a bounded scale keeps the
-# heavy-tail quantiles from blowing past the tolerance. sigma is a pure linear
-# scale of the quantile, so this still exercises it fully.
-SIGMA_ICDF = Domain([0.1, 0.5, 1.0, 2.0], dtype="float64")
+# xi is unconstrained for the GPD family, so its domain carries explicit
+# ``(None, None)`` edges: the harness then runs no "just-outside-the-edge"
+# invalid-xi probe (there is no invalid xi) while still exercising every listed
+# value -- the exponential limit xi = 0 and both tails. Two deliberate bounds on
+# the range:
+#   * strictly > -1: at xi <= -1 the GPD becomes (sub-)uniform with a *finite*
+#     density at its closed upper endpoint, a measure-zero point where the
+#     open-support convention here (-inf at the wall) legitimately differs from
+#     SciPy. ``TestGenParetoBoundaries`` covers the xi < 0 wall directly.
+#   * <= 1: a heavier tail (e.g. xi = 5) pushes the q = 0.99 quantile to ~1e10,
+#     where ``check_icdf``'s *absolute* tolerance fails on a value that is in
+#     fact correct to ~1e-15 relative -- false precision, not a real error.
+XI_DOMAIN = Domain([-0.9, -0.5, -0.1, 0, 0.1, 0.5, 1], dtype="float64", edges=(None, None))
+# kappa > 0: the trailing inf leaves the upper edge unbounded (no invalid probe
+# above) while the leading 0 lets the harness probe kappa <= 0 (must raise). The
+# inner values are the actual test points.
+KAPPA_DOMAIN = Domain([0, 0.25, 0.5, 1, 2, 5, np.inf], dtype="float64")
+# ``check_icdf`` compares absolute quantile values, so cap sigma to keep the
+# heavy-tail quantiles within tolerance; the leading 0 / trailing inf still let
+# the harness probe sigma <= 0 (must raise). sigma is a pure linear scale.
+SIGMA_ICDF = Domain([0, 0.1, 0.5, 1.0, 2.0, np.inf], dtype="float64")
 
 
 def ref_ext_logp(value, mu, sigma, xi, kappa):
@@ -243,6 +258,8 @@ class TestGenParetoClass:
     PyMC directly on adoption.
     """
 
+    pytestmark = _GPD_FPE_FILTERS
+
     def test_logp(self):
         check_logp(
             GenPareto,
@@ -250,7 +267,6 @@ class TestGenParetoClass:
             {"mu": Domain([0], edges=(None, None)), "sigma": Rplusbig, "xi": XI_DOMAIN},
             lambda value, mu, sigma, xi: sp.genpareto.logpdf(value, c=xi, loc=mu, scale=sigma),
             decimal=select_by_precision(float64=6, float32=3),
-            skip_paramdomain_outside_edge_test=True,
         )
 
     def test_logcdf(self):
@@ -260,7 +276,6 @@ class TestGenParetoClass:
             {"mu": Domain([0], edges=(None, None)), "sigma": Rplusbig, "xi": XI_DOMAIN},
             lambda value, mu, sigma, xi: sp.genpareto.logcdf(value, c=xi, loc=mu, scale=sigma),
             decimal=select_by_precision(float64=6, float32=3),
-            skip_paramdomain_outside_edge_test=True,
         )
 
     def test_icdf(self):
@@ -269,7 +284,6 @@ class TestGenParetoClass:
             {"mu": Domain([0], edges=(None, None)), "sigma": SIGMA_ICDF, "xi": XI_DOMAIN},
             lambda q, mu, sigma, xi: sp.genpareto.ppf(q, c=xi, loc=mu, scale=sigma),
             decimal=select_by_precision(float64=5, float32=3),
-            skip_paramdomain_outside_edge_test=True,
         )
 
     @pytest.mark.parametrize(
@@ -307,6 +321,8 @@ class TestExtGenParetoClass:
     PyMC directly on adoption.
     """
 
+    pytestmark = _GPD_FPE_FILTERS
+
     def test_logp(self):
         check_logp(
             ExtGenPareto,
@@ -319,7 +335,6 @@ class TestExtGenParetoClass:
             },
             ref_ext_logp,
             decimal=select_by_precision(float64=6, float32=3),
-            skip_paramdomain_outside_edge_test=True,
         )
 
     def test_logcdf(self):
@@ -334,7 +349,6 @@ class TestExtGenParetoClass:
             },
             ref_ext_logcdf,
             decimal=select_by_precision(float64=6, float32=3),
-            skip_paramdomain_outside_edge_test=True,
         )
 
     def test_icdf(self):
@@ -348,7 +362,6 @@ class TestExtGenParetoClass:
             },
             ref_ext_icdf,
             decimal=select_by_precision(float64=5, float32=3),
-            skip_paramdomain_outside_edge_test=True,
         )
 
     def test_kappa_one_equals_gpd(self):
@@ -392,6 +405,59 @@ class TestExtGenPareto(BaseTestDistributionRandom):
     pymc_dist_params = {"mu": 0.0, "sigma": 1.5, "xi": 0.2, "kappa": 2.0}
     expected_rv_op_params = {"mu": 0.0, "sigma": 1.5, "xi": 0.2, "kappa": 2.0}
     tests_to_run = ["check_pymc_params_match_rv_op", "check_rv_size"]
+
+
+class TestGenParetoBoundaries:
+    """Explicit boundary / invalid-input behaviour for both GPD classes.
+
+    These are exactly the cases an external review found regressing: ``x = inf``,
+    ``q = 0``, ``q = 1`` (with ``xi < 0``), and ``sigma`` / ``kappa`` out of range.
+    """
+
+    pytestmark = _GPD_FPE_FILTERS
+
+    def test_logp_logcdf_at_infinity(self):
+        # density at +inf is 0 (logp -inf); CDF at +inf is 1 (logcdf 0). The
+        # xi=0 path is the delicate one: xi*inf is nan without _safe_mul.
+        for xi in (-0.5, 0.0, 0.5):
+            assert pm.logp(GenPareto.dist(mu=0.0, sigma=1.0, xi=xi), np.inf).eval() == -np.inf
+            assert pm.logcdf(GenPareto.dist(mu=0.0, sigma=1.0, xi=xi), np.inf).eval() == 0.0
+            ext = ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=xi, kappa=2.0)
+            assert pm.logp(ext, np.inf).eval() == -np.inf
+            assert pm.logcdf(ext, np.inf).eval() == 0.0
+
+    def test_icdf_endpoints(self):
+        # q=0 -> mu (lower endpoint); q=1 -> finite upper bound (xi<0) or +inf.
+        for xi in (-0.5, 0.0, 0.5):
+            expected_hi = 1.0 - 2.0 / xi if xi < 0 else np.inf
+            assert pm.icdf(GenPareto.dist(mu=1.0, sigma=2.0, xi=xi), 0.0).eval() == 1.0
+            np.testing.assert_allclose(
+                pm.icdf(GenPareto.dist(mu=1.0, sigma=2.0, xi=xi), 1.0).eval(), expected_hi
+            )
+        # ExtGPD shares the same endpoints (carrier maps 0->0, 1->1).
+        for xi, kappa in ((-0.5, 2.0), (0.0, 0.5), (0.5, 3.0)):
+            expected_hi = 1.0 - 2.0 / xi if xi < 0 else np.inf
+            ext = ExtGenPareto.dist(mu=1.0, sigma=2.0, xi=xi, kappa=kappa)
+            assert pm.icdf(ext, 0.0).eval() == 1.0
+            np.testing.assert_allclose(pm.icdf(ext, 1.0).eval(), expected_hi)
+
+    def test_icdf_outside_unit_interval_is_nan(self):
+        for q in (-0.1, 1.1):
+            assert np.isnan(pm.icdf(GenPareto.dist(mu=0.0, sigma=1.0, xi=0.2), q).eval())
+            ext = ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.2, kappa=2.0)
+            assert np.isnan(pm.icdf(ext, q).eval())
+
+    def test_invalid_sigma_raises(self):
+        for sigma in (0.0, -1.0):
+            with pytest.raises(ParameterValueError):
+                pm.logp(GenPareto.dist(mu=0.0, sigma=sigma, xi=0.1), 1.0).eval()
+            with pytest.raises(ParameterValueError):
+                pm.logp(ExtGenPareto.dist(mu=0.0, sigma=sigma, xi=0.1, kappa=2.0), 1.0).eval()
+
+    def test_invalid_kappa_raises(self):
+        for kappa in (0.0, -1.0):
+            with pytest.raises(ParameterValueError):
+                pm.logp(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.1, kappa=kappa), 1.0).eval()
 
 
 class TestGenParetoSmoothShapeLimit:
