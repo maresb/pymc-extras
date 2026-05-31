@@ -23,6 +23,7 @@ from pymc_extras.distributions.discrete import (
     GeneralizedPoisson,
     Skellam,
 )
+from pymc_extras.distributions.generalized_pareto import ExtGenPareto, GenPareto
 from pymc_extras.distributions.histogram_utils import histogram_approximation
 from pymc_extras.distributions.multivariate import R2D2M2CP
 from pymc_extras.distributions.timeseries import DiscreteMarkovChain
@@ -33,7 +34,9 @@ __all__ = [
     "BetaNegativeBinomial",
     "Chi",
     "DiscreteMarkovChain",
+    "ExtGenPareto",
     "GenExtreme",
+    "GenPareto",
     "GeneralizedPoisson",
     "Maxwell",
     "PartialOrder",
