@@ -363,9 +363,11 @@ class Maxwell:
 # ===========================================================================
 # These two distributions are built in three layers, top to bottom:
 #
-# 1. Pure PyTensor math (``gen_pareto_logp`` / ``_logcdf`` / ``_icdf`` and the
-#    extended-family variants), depending only on ``pytensor`` so it can be
-#    reused directly or lifted into ``pytensor-distributions`` unchanged.
+# 1. Pure PyTensor math kernels (``gen_pareto_logp`` / ``_logcdf`` / ``_icdf``
+#    and the extended-family variants), depending only on ``pytensor``. These
+#    math kernels are portable -- they can be dropped into another library such
+#    as ``pytensor-distributions`` -- but they are only the density/CDF/quantile
+#    expressions, not the full functional API (pdf, sf, isf, rvs, moments, ...).
 # 2. ``SymbolicRandomVariable`` Ops that sample by inverse-CDF on a uniform
 #    draw, so the random methods work on every backend (C, Numba, JAX) without
 #    a SciPy object-mode fallback.
@@ -423,17 +425,23 @@ def _expm1_div(u: TensorVariable) -> TensorVariable:
 
 
 def _safe_mul(a, b):
-    """``a * b`` with the IEEE ``0 * inf -> nan`` mapped back to ``0``.
+    """``a * b``, repairing ONLY the indeterminate ``0 * inf`` to ``0``.
 
     Only ``xi * z`` needs this: at ``xi = 0`` with an infinite observation the
     product is mathematically ``0`` (the exponential GPD carries no shape term),
     but ``0.0 * inf`` is ``nan`` under IEEE, and a ``nan`` in the unused branch of
     a ``switch`` can still leak (the backend may lower it to ``cond*a + ...``).
-    Restoring the ``0`` keeps logp/logcdf at the boundary finite (``-inf`` / ``0``)
-    instead of ``nan``.
+
+    The repair is restricted to the exact ``{0} x {+-inf}`` cases so that a
+    genuine ``nan`` in ``a`` or ``b`` (e.g. ``xi = nan`` from bad input) still
+    propagates instead of being silently turned into the ``xi = 0`` branch.
     """
     prod = a * b
-    return pt.switch(pt.isnan(prod), 0.0, prod)
+    zero_times_inf = pt.or_(
+        pt.and_(pt.eq(a, 0), pt.isinf(b)),
+        pt.and_(pt.eq(b, 0), pt.isinf(a)),
+    )
+    return pt.switch(zero_times_inf, 0.0, prod)
 
 
 def _gpd_log_h(z, sigma, xi):
@@ -469,9 +477,9 @@ def _in_gpd_support(z, xi):
 
 # The ``gen_pareto_*`` / ``ext_gen_pareto_*`` builders below are pure PyTensor:
 # they assemble the masked log-density / log-CDF / quantile graphs and call NO
-# PyMC parameter check, so they can be reused as-is (e.g. in
-# pytensor-distributions). Parameter validation lives only in the Continuous
-# wrapper classes, which add ``check_parameters`` / ``check_icdf_*``.
+# PyMC parameter check, which keeps them portable (the math can be reused
+# elsewhere, e.g. in pytensor-distributions). Parameter validation lives only in
+# the Continuous wrapper classes, which add ``check_parameters`` / ``check_icdf_*``.
 
 
 def gen_pareto_logp(value, mu, sigma, xi):
@@ -661,6 +669,19 @@ class GenPareto(Continuous):
     .. [2] Pickands, J. (1975). Statistical Inference Using Extreme Order
         Statistics. Annals of Statistics, 3(1), 119-131.
 
+    Notes
+    -----
+    For :math:`\xi < 0` the support has a finite right endpoint
+    :math:`x_F = \mu - \sigma/\xi`. This implementation uses the *open* support
+    convention at that wall: ``logp`` returns :math:`-\infty` and ``logcdf``
+    returns :math:`0` for :math:`x \geq x_F`. For :math:`-1 < \xi < 0` this is
+    exact -- the density tends to :math:`0` as :math:`x \to x_F^-` -- but it
+    differs from SciPy at the boundary itself for :math:`\xi \leq -1` (where
+    SciPy reports a finite density at :math:`\xi = -1`, or a divergence for
+    :math:`\xi < -1`). Those are measure-zero points that do not affect sampling
+    or integration, and :math:`\xi \leq -1` corresponds to an extremely
+    short-tailed regime that rarely arises in practice.
+
     Examples
     --------
     .. code-block:: python
@@ -764,6 +785,14 @@ class ExtGenPareto(Continuous):
     .. [2] Papastathopoulos, I., & Tawn, J. A. (2013). Extended generalised
         Pareto models for tail estimation. Journal of Statistical Planning and
         Inference, 143(1), 131-143.
+
+    Notes
+    -----
+    The upper tail is the GPD tail, so the same open-support convention applies:
+    for :math:`\xi < 0`, ``logp`` is :math:`-\infty` and ``logcdf`` is :math:`0`
+    at and beyond the finite right endpoint :math:`\mu - \sigma/\xi`. See the
+    Notes on :class:`GenPareto` for the (measure-zero) boundary behaviour at
+    :math:`\xi \leq -1`.
 
     Examples
     --------

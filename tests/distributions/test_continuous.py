@@ -459,6 +459,72 @@ class TestGenParetoBoundaries:
             with pytest.raises(ParameterValueError):
                 pm.logp(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.1, kappa=kappa), 1.0).eval()
 
+    def test_nan_xi_does_not_become_exponential(self):
+        # ``_safe_mul`` repairs only the indeterminate ``0 * inf``; a genuine
+        # nan ``xi`` must NOT be silently turned into the xi = 0 (exponential)
+        # branch. The exact non-finite value (nan vs -inf from the support mask)
+        # is unimportant -- what matters is it never equals the xi = 0 result.
+        x = 1.0
+        exp_logp = float(pm.logp(GenPareto.dist(mu=0.0, sigma=1.0, xi=0.0), x).eval())
+        nan_logp = float(pm.logp(GenPareto.dist(mu=0.0, sigma=1.0, xi=np.nan), x).eval())
+        assert np.isfinite(exp_logp)  # sanity: the xi=0 branch is finite here
+        assert not np.isfinite(nan_logp)  # nan xi must not yield a finite value
+        assert nan_logp != exp_logp
+        ext_nan = float(
+            pm.logp(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=np.nan, kappa=2.0), x).eval()
+        )
+        assert not np.isfinite(ext_nan)
+
+
+class TestGenParetoHeavyTail:
+    """Heavy-tail (xi > 1) coverage with *relative* tolerance.
+
+    The generic ``check_icdf`` harness uses an absolute tolerance, so it cannot
+    exercise xi > 1 -- the quantiles there are ~1e10 and dwarf any absolute
+    bound. But xi > 1 is precisely the infinite-mean regime where the median
+    ``support_point`` matters, so test it directly against SciPy with rtol.
+    """
+
+    pytestmark = _GPD_FPE_FILTERS
+
+    @pytest.mark.parametrize("xi", [1.5, 3.0, 5.0])
+    def test_logp_logcdf_icdf_match_scipy(self, xi):
+        mu, sigma = 0.0, 1.3
+        x = np.array([0.5, 2.0, 10.0, 1e4])
+        np.testing.assert_allclose(
+            pm.logp(GenPareto.dist(mu=mu, sigma=sigma, xi=xi), x).eval(),
+            sp.genpareto.logpdf(x, c=xi, loc=mu, scale=sigma),
+            rtol=1e-10,
+        )
+        np.testing.assert_allclose(
+            pm.logcdf(GenPareto.dist(mu=mu, sigma=sigma, xi=xi), x).eval(),
+            sp.genpareto.logcdf(x, c=xi, loc=mu, scale=sigma),
+            rtol=1e-10,
+        )
+        q = np.array([0.1, 0.5, 0.9, 0.99, 0.999])
+        np.testing.assert_allclose(
+            pm.icdf(GenPareto.dist(mu=mu, sigma=sigma, xi=xi), q).eval(),
+            sp.genpareto.ppf(q, c=xi, loc=mu, scale=sigma),
+            rtol=1e-9,
+        )
+
+    @pytest.mark.parametrize("xi", [1.5, 3.0])
+    def test_support_point_is_median_with_infinite_mean(self, xi):
+        # mean is infinite for xi >= 1, so support_point must fall back to the
+        # median (not the mean) -- check it equals the GPD median.
+        mu, sigma = 1.0, 2.0
+        with pm.Model() as model:
+            GenPareto("x", mu=mu, sigma=sigma, xi=xi)
+        expected = sp.genpareto.ppf(0.5, c=xi, loc=mu, scale=sigma)
+        assert_support_point_is_expected(model, expected)
+
+    def test_ext_support_point_median_infinite_mean(self):
+        mu, sigma, xi, kappa = 0.0, 1.0, 2.0, 3.0
+        with pm.Model() as model:
+            ExtGenPareto("x", mu=mu, sigma=sigma, xi=xi, kappa=kappa)
+        expected = ref_ext_icdf(0.5, mu, sigma, xi, kappa)
+        assert_support_point_is_expected(model, expected)
+
 
 class TestGenParetoSmoothShapeLimit:
     """The headline property: the logp is C1 in xi through the xi = 0 limit.
