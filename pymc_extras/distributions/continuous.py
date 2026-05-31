@@ -24,7 +24,11 @@ import pytensor.tensor as pt
 
 from pymc import ChiSquared, CustomDist
 from pymc.distributions import transforms
-from pymc.distributions.dist_math import check_parameters
+from pymc.distributions.dist_math import (
+    check_icdf_parameters,
+    check_icdf_value,
+    check_parameters,
+)
 from pymc.distributions.distribution import Continuous, SymbolicRandomVariable
 from pymc.distributions.shape_utils import implicit_size_from_params, rv_size_is_none
 from pymc.logprob.utils import CheckParameterValue
@@ -418,14 +422,29 @@ def _expm1_div(u: TensorVariable) -> TensorVariable:
 # All three reduce to the exponential law as xi -> 0 (m -> z).
 
 
+def _safe_mul(a, b):
+    """``a * b`` with the IEEE ``0 * inf -> nan`` mapped back to ``0``.
+
+    Only ``xi * z`` needs this: at ``xi = 0`` with an infinite observation the
+    product is mathematically ``0`` (the exponential GPD carries no shape term),
+    but ``0.0 * inf`` is ``nan`` under IEEE, and a ``nan`` in the unused branch of
+    a ``switch`` can still leak (the backend may lower it to ``cond*a + ...``).
+    Restoring the ``0`` keeps logp/logcdf at the boundary finite (``-inf`` / ``0``)
+    instead of ``nan``.
+    """
+    prod = a * b
+    return pt.switch(pt.isnan(prod), 0.0, prod)
+
+
 def _gpd_log_h(z, sigma, xi):
     """GPD log-density, in-support expression (no support masking)."""
-    return -pt.log(sigma) - pt.log1p(xi * z) - z * _log1p_div(xi * z)
+    t = _safe_mul(xi, z)
+    return -pt.log(sigma) - pt.log1p(t) - z * _log1p_div(t)
 
 
 def _gpd_log_H(z, xi):
     """GPD log-CDF, in-support expression (no support masking / no saturation)."""
-    return pt.log1mexp(-(z * _log1p_div(xi * z)))
+    return pt.log1mexp(-(z * _log1p_div(_safe_mul(xi, z))))
 
 
 def _gpd_quantile_from_excess(excess, mu, sigma, xi):
@@ -438,38 +457,54 @@ def _gpd_quantile_from_excess(excess, mu, sigma, xi):
     return mu + sigma * excess * _expm1_div(xi * excess)
 
 
+def _gpd_upper_bound(mu, sigma, xi):
+    """Right endpoint of the GPD support: ``mu - sigma / xi`` for xi < 0, else +inf."""
+    return pt.switch(pt.lt(xi, 0), mu - sigma / xi, np.inf)
+
+
 def _in_gpd_support(z, xi):
     """Boolean mask of the GPD support: z >= 0 and (for xi < 0) z <= -1/xi."""
-    return pt.and_(z >= 0, 1 + xi * z > 0)
+    return pt.and_(z >= 0, 1 + _safe_mul(xi, z) > 0)
+
+
+# The ``gen_pareto_*`` / ``ext_gen_pareto_*`` builders below are pure PyTensor:
+# they assemble the masked log-density / log-CDF / quantile graphs and call NO
+# PyMC parameter check, so they can be reused as-is (e.g. in
+# pytensor-distributions). Parameter validation lives only in the Continuous
+# wrapper classes, which add ``check_parameters`` / ``check_icdf_*``.
 
 
 def gen_pareto_logp(value, mu, sigma, xi):
-    """Log-density of the Generalized Pareto distribution."""
+    """Pure-PyTensor GPD log-density; out-of-support values map to ``-inf``."""
     z = (value - mu) / sigma
-    # Out-of-support values get -inf via the switch; check_parameters only guards
-    # the scalar parameter (it raises, which is the wrong response for a value
-    # being out of support).
     logp = pt.switch(_in_gpd_support(z, xi), _gpd_log_h(z, sigma, xi), -np.inf)
-    return check_parameters(logp, sigma > 0, msg="sigma > 0")
+    # The density vanishes at the +inf tail for every xi; for xi > 0 the
+    # in-support branch would evaluate log1p(inf)/inf -> nan there, so pin
+    # z = +inf to -inf explicitly.
+    return pt.switch(pt.eq(z, np.inf), -np.inf, logp)
 
 
 def gen_pareto_logcdf(value, mu, sigma, xi):
-    """Log-CDF of the Generalized Pareto distribution."""
+    """Pure-PyTensor GPD log-CDF."""
     z = (value - mu) / sigma
-    # Three regions: below mu the CDF is 0 (-inf); for xi < 0 past the finite
-    # upper endpoint mu - sigma/xi it saturates at 1 (log-CDF 0); else log1mexp(-m).
-    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + xi * z, 0))
+    # Three regions: below mu -> 0 (log -inf); for xi < 0 past the finite upper
+    # endpoint mu - sigma/xi -> 1 (log 0); else log1mexp(-m).
+    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + _safe_mul(xi, z), 0))
     logcdf = pt.switch(above_upper, 0.0, _gpd_log_H(z, xi))
     logcdf = pt.switch(z >= 0, logcdf, -np.inf)
-    return check_parameters(logcdf, sigma > 0, msg="sigma > 0")
+    # CDF -> 1 (logcdf 0) at the +inf tail; for xi > 0 _gpd_log_H(inf) is nan.
+    return pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
 
 
 def gen_pareto_icdf(value, mu, sigma, xi):
-    """Inverse CDF (quantile function) of the Generalized Pareto distribution."""
+    """Pure-PyTensor GPD quantile function (assumes ``0 <= value <= 1``)."""
+    value = pt.as_tensor_variable(value)
     excess = -pt.log1p(-value)  # = -log(1 - q) = m
     x = _gpd_quantile_from_excess(excess, mu, sigma, xi)
-    x = pt.switch(pt.and_(value >= 0, value <= 1), x, np.nan)
-    return check_parameters(x, sigma > 0, msg="sigma > 0")
+    # Explicit endpoints: q=1 -> finite upper bound (xi<0) or +inf, q=0 -> mu.
+    # Without this, q=1 with xi<0 is ``inf * 0 = nan`` rather than ``mu - sigma/xi``.
+    x = pt.switch(pt.eq(value, 1), _gpd_upper_bound(mu, sigma, xi), x)
+    return pt.switch(pt.eq(value, 0), mu, x)
 
 
 # Extended Generalized Pareto core. Naveau et al. (2016) extended GPD with
@@ -479,7 +514,7 @@ def gen_pareto_icdf(value, mu, sigma, xi):
 
 
 def ext_gen_pareto_logp(value, mu, sigma, xi, kappa):
-    """Log-density of the Extended Generalized Pareto distribution."""
+    """Pure-PyTensor extended-GPD log-density; out-of-support values map to ``-inf``."""
     z = (value - mu) / sigma
     # log g = log kappa + (kappa - 1) log H + log h. The carrier term vanishes
     # at kappa = 1; guarding it keeps the GPD reduction exact at the lower
@@ -487,27 +522,28 @@ def ext_gen_pareto_logp(value, mu, sigma, xi, kappa):
     carrier = pt.switch(pt.eq(kappa, 1.0), 0.0, (kappa - 1) * _gpd_log_H(z, xi))
     logp = pt.log(kappa) + carrier + _gpd_log_h(z, sigma, xi)
     logp = pt.switch(_in_gpd_support(z, xi), logp, -np.inf)
-    return check_parameters(logp, sigma > 0, kappa > 0, msg="sigma > 0, kappa > 0")
+    return pt.switch(pt.eq(z, np.inf), -np.inf, logp)
 
 
 def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
-    """Log-CDF of the Extended Generalized Pareto distribution."""
+    """Pure-PyTensor extended-GPD log-CDF."""
     z = (value - mu) / sigma
-    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + xi * z, 0))
+    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + _safe_mul(xi, z), 0))
     logcdf = pt.switch(above_upper, 0.0, kappa * _gpd_log_H(z, xi))
     logcdf = pt.switch(z >= 0, logcdf, -np.inf)
-    return check_parameters(logcdf, sigma > 0, kappa > 0, msg="sigma > 0, kappa > 0")
+    return pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
 
 
 def ext_gen_pareto_icdf(value, mu, sigma, xi, kappa):
-    """Inverse CDF of the Extended Generalized Pareto distribution."""
+    """Pure-PyTensor extended-GPD quantile function (assumes ``0 <= value <= 1``)."""
+    value = pt.as_tensor_variable(value)
     # F = H ** kappa = q  ->  H = q ** (1/kappa); the GPD excess is -log(1 - H),
     # and 1 - H = -expm1(log(q)/kappa) (stable as q ** (1/kappa) -> 1).
     gpd_survival = -pt.expm1(pt.log(value) / kappa)
     excess = -pt.log(gpd_survival)
     x = _gpd_quantile_from_excess(excess, mu, sigma, xi)
-    x = pt.switch(pt.and_(value >= 0, value <= 1), x, np.nan)
-    return check_parameters(x, sigma > 0, kappa > 0, msg="sigma > 0, kappa > 0")
+    x = pt.switch(pt.eq(value, 1), _gpd_upper_bound(mu, sigma, xi), x)
+    return pt.switch(pt.eq(value, 0), mu, x)
 
 
 def _uniform_draw(size, rng):
@@ -649,13 +685,15 @@ class GenPareto(Continuous):
         return super().dist([mu, sigma, xi], **kwargs)
 
     def logp(value, mu, sigma, xi):
-        return gen_pareto_logp(value, mu, sigma, xi)
+        return check_parameters(gen_pareto_logp(value, mu, sigma, xi), sigma > 0, msg="sigma > 0")
 
     def logcdf(value, mu, sigma, xi):
-        return gen_pareto_logcdf(value, mu, sigma, xi)
+        return check_parameters(gen_pareto_logcdf(value, mu, sigma, xi), sigma > 0, msg="sigma > 0")
 
     def icdf(value, mu, sigma, xi):
-        return gen_pareto_icdf(value, mu, sigma, xi)
+        res = gen_pareto_icdf(value, mu, sigma, xi)
+        res = check_icdf_value(res, value)
+        return check_icdf_parameters(res, sigma > 0, msg="sigma > 0")
 
     def support_point(rv, size, mu, sigma, xi):
         # Median: mean is infinite for xi >= 1, so the median is the safe point.
@@ -753,13 +791,25 @@ class ExtGenPareto(Continuous):
         return super().dist([mu, sigma, xi, kappa], **kwargs)
 
     def logp(value, mu, sigma, xi, kappa):
-        return ext_gen_pareto_logp(value, mu, sigma, xi, kappa)
+        return check_parameters(
+            ext_gen_pareto_logp(value, mu, sigma, xi, kappa),
+            sigma > 0,
+            kappa > 0,
+            msg="sigma > 0, kappa > 0",
+        )
 
     def logcdf(value, mu, sigma, xi, kappa):
-        return ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa)
+        return check_parameters(
+            ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa),
+            sigma > 0,
+            kappa > 0,
+            msg="sigma > 0, kappa > 0",
+        )
 
     def icdf(value, mu, sigma, xi, kappa):
-        return ext_gen_pareto_icdf(value, mu, sigma, xi, kappa)
+        res = ext_gen_pareto_icdf(value, mu, sigma, xi, kappa)
+        res = check_icdf_value(res, value)
+        return check_icdf_parameters(res, sigma > 0, kappa > 0, msg="sigma > 0, kappa > 0")
 
     def support_point(rv, size, mu, sigma, xi, kappa):
         # Median solves H(m) ** kappa = 1/2, i.e. the ExtGPD quantile at 1/2.
