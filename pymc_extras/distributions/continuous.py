@@ -31,6 +31,7 @@ from pymc.distributions.dist_math import (
 )
 from pymc.distributions.distribution import Continuous, SymbolicRandomVariable
 from pymc.distributions.shape_utils import implicit_size_from_params, rv_size_is_none
+from pymc.distributions.transforms import Interval, _default_transform
 from pymc.logprob.utils import CheckParameterValue
 from pymc.pytensorf import floatX, normalize_rng_param
 from pytensor.tensor.random.basic import uniform
@@ -450,9 +451,19 @@ def _gpd_log_h(z, sigma, xi):
     return -pt.log(sigma) - pt.log1p(t) - z * _log1p_div(t)
 
 
+def _gpd_log_S(z, xi):
+    """GPD log survival ``log(1 - H) = -m``, in-support expression.
+
+    Computed directly from the survival exponent ``m = log1p(xi z) / xi`` rather
+    than as ``log1mexp(log H)``, so it stays exact arbitrarily deep in the upper
+    tail (where ``log H -> 0`` and any ``H``-based route underflows).
+    """
+    return -(z * _log1p_div(_safe_mul(xi, z)))
+
+
 def _gpd_log_H(z, xi):
     """GPD log-CDF, in-support expression (no support masking / no saturation)."""
-    return pt.log1mexp(-(z * _log1p_div(_safe_mul(xi, z))))
+    return pt.log1mexp(_gpd_log_S(z, xi))
 
 
 def _gpd_quantile_from_excess(excess, mu, sigma, xi):
@@ -489,7 +500,11 @@ def gen_pareto_logp(value, mu, sigma, xi):
     # The density vanishes at the +inf tail for every xi; for xi > 0 the
     # in-support branch would evaluate log1p(inf)/inf -> nan there, so pin
     # z = +inf to -inf explicitly.
-    return pt.switch(pt.eq(z, np.inf), -np.inf, logp)
+    logp = pt.switch(pt.eq(z, np.inf), -np.inf, logp)
+    # Propagate a non-finite shape: ``1 + xi z`` is nan when xi is nan, and the
+    # support switch would otherwise mask it to -inf ("valid param, impossible
+    # value"). nan in -> nan out, matching how pymc's own distributions behave.
+    return pt.switch(pt.isnan(1 + _safe_mul(xi, z)), np.nan, logp)
 
 
 def gen_pareto_logcdf(value, mu, sigma, xi):
@@ -513,7 +528,7 @@ def gen_pareto_logccdf(value, mu, sigma, xi):
     natural ``logsf`` primitive for a peaks-over-threshold model.
     """
     z = (value - mu) / sigma
-    logsf = -(z * _log1p_div(_safe_mul(xi, z)))  # log S = -m
+    logsf = _gpd_log_S(z, xi)  # log S = -m, exact in the tail
     # For xi < 0 past the finite upper endpoint, and at the +inf tail, S = 0.
     above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + _safe_mul(xi, z), 0))
     logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
@@ -547,7 +562,9 @@ def ext_gen_pareto_logp(value, mu, sigma, xi, kappa):
     carrier = pt.switch(pt.eq(kappa, 1.0), 0.0, (kappa - 1) * _gpd_log_H(z, xi))
     logp = pt.log(kappa) + carrier + _gpd_log_h(z, sigma, xi)
     logp = pt.switch(_in_gpd_support(z, xi), logp, -np.inf)
-    return pt.switch(pt.eq(z, np.inf), -np.inf, logp)
+    logp = pt.switch(pt.eq(z, np.inf), -np.inf, logp)
+    # Propagate a non-finite shape (see gen_pareto_logp).
+    return pt.switch(pt.isnan(1 + _safe_mul(xi, z)), np.nan, logp)
 
 
 def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
@@ -562,11 +579,25 @@ def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
 def ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa):
     """Pure-PyTensor extended-GPD log complementary CDF (log survival function).
 
-    ``S = 1 - H ** kappa``; ``log S = log1mexp(kappa * log H)``. The upper tail is
-    the GPD tail, so this inherits the GPD survival's tail stability.
+    ``S = 1 - H ** kappa``. The naive ``log1mexp(kappa * log H)`` collapses to
+    ``-inf`` deep in the tail, because ``log H -> 0`` underflows there even though
+    ``S`` is still finite (``~ kappa * S_gpd``). Two regimes keyed on the GPD log
+    survival ``a = log(1 - H)``:
+
+    - well inside (``a`` not tiny): ``log1mexp(kappa * log1mexp(a))`` -- exact.
+    - deep tail (``a < -30``): ``1 - H**kappa = 1 - (1 - S_gpd)**kappa
+      = kappa S_gpd [1 - (kappa-1)/2 S_gpd + (kappa-1)(kappa-2)/6 S_gpd**2 - ...]``;
+      take logs. The two pieces agree to ~1e-8 at the crossover, so the seam is
+      smooth.
     """
     z = (value - mu) / sigma
-    logsf = pt.log1mexp(kappa * _gpd_log_H(z, xi))
+    a = _gpd_log_S(z, xi)  # log(1 - H), exact in the tail
+    log_H = pt.log1mexp(a)
+    generic = pt.log1mexp(kappa * log_H)
+    s = pt.exp(a)  # S_gpd, tiny in the tail
+    series = 1.0 - (kappa - 1) / 2.0 * s + (kappa - 1) * (kappa - 2) / 6.0 * s**2
+    tail = pt.log(kappa) + a + pt.log1p(series - 1.0)
+    logsf = pt.switch(a < -30.0, tail, generic)
     above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + _safe_mul(xi, z), 0))
     logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
     return pt.switch(z < 0, 0.0, logsf)
@@ -674,14 +705,17 @@ class GenPareto(Continuous):
 
     ========  =========================================================================
     Support   * :math:`x \geq \mu`, when :math:`\xi \geq 0`
-              * :math:`\mu \leq x \leq \mu - \sigma/\xi`, when :math:`\xi < 0`
+              * :math:`\mu \leq x < \mu - \sigma/\xi`, when :math:`\xi < 0`
+                (open at the right endpoint; see Notes)
     Mean      * :math:`\mu + \sigma / (1 - \xi)`, when :math:`\xi < 1`
               * :math:`\infty`, when :math:`\xi \geq 1`
     Variance  * :math:`\sigma^2 / ((1 - \xi)^2 (1 - 2\xi))`, when :math:`\xi < 1/2`
               * :math:`\infty`, when :math:`\xi \geq 1/2`
     Median    :math:`\mu + \sigma (2^{\xi} - 1) / \xi` (:math:`\mu + \sigma \ln 2`
               at :math:`\xi = 0`)
-    Mode      :math:`\mu`
+    Mode      :math:`\mu`, when :math:`\xi > -1` (the density is decreasing). For
+              :math:`\xi \leq -1` the density is non-decreasing and its supremum
+              sits at the right endpoint :math:`\mu - \sigma/\xi`.
     Entropy   :math:`\ln \sigma + \xi + 1`
     ========  =========================================================================
 
@@ -805,17 +839,21 @@ class ExtGenPareto(Continuous):
 
     ========  =========================================================================
     Support   * :math:`x \geq \mu`, when :math:`\xi \geq 0`
-              * :math:`\mu \leq x \leq \mu - \sigma/\xi`, when :math:`\xi < 0`
+              * :math:`\mu \leq x < \mu - \sigma/\xi`, when :math:`\xi < 0`
+                (open at the right endpoint, as for :class:`GenPareto`)
     Mean      :math:`\mu + \frac{\sigma}{\xi}\left[\kappa B(\kappa, 1 - \xi) - 1\right]`,
               when :math:`\xi < 1`
     Variance  :math:`\left(\frac{\sigma}{\xi}\right)^2
               \left[\kappa B(\kappa, 1 - 2\xi) - 2\kappa B(\kappa, 1 - \xi) + 1\right]
               - (\text{Mean} - \mu)^2`, when :math:`\xi < 1/2`
-    Median    :math:`Q\!\left(2^{-1/\kappa}\right)`, the GPD quantile (see
-              :class:`GenPareto`) at survival probability :math:`2^{-1/\kappa}`
+    Median    the GPD quantile :math:`Q\!\left(2^{-1/\kappa}\right)` (see
+              :class:`GenPareto`), i.e. the point at CDF probability
+              :math:`H = 2^{-1/\kappa}`, equivalently survival
+              :math:`1 - 2^{-1/\kappa}`
     Mode      * :math:`\mu + \frac{\sigma}{\xi}\left[(T^\star)^{-\xi} - 1\right]`,
-              :math:`T^\star = \frac{1 + \xi}{\kappa + \xi}`, when :math:`\kappa > 1`
-              * :math:`\mu`, when :math:`\kappa \leq 1`
+              :math:`T^\star = \frac{1 + \xi}{\kappa + \xi}`, when
+              :math:`\kappa > 1` and :math:`\xi > -1`
+              * :math:`\mu`, when :math:`\kappa \leq 1` (and :math:`\xi > -1`)
     ========  =========================================================================
 
     Here :math:`B(a, b) = \Gamma(a)\Gamma(b)/\Gamma(a + b)` is the Beta function;
@@ -823,8 +861,10 @@ class ExtGenPareto(Continuous):
     the GPD. As :math:`\xi \to 0` the mean tends to
     :math:`\mu + \sigma(\psi(\kappa + 1) + \gamma)` (digamma :math:`\psi`,
     Euler--Mascheroni :math:`\gamma`) and the variance to
-    :math:`\sigma^2(\pi^2/6 - \psi'(\kappa + 1))`. The ``support_point`` is the
-    median (finite for all :math:`\xi`).
+    :math:`\sigma^2(\pi^2/6 - \psi'(\kappa + 1))`. The mode formulae above assume
+    :math:`\xi > -1`; for :math:`\xi \leq -1` the supremum sits at the right
+    endpoint, as for :class:`GenPareto`. The ``support_point`` is the median
+    (finite for all :math:`\xi`).
 
     Parameters
     ----------
@@ -916,3 +956,27 @@ class ExtGenPareto(Continuous):
         if not rv_size_is_none(size):
             median = pt.full(size, median)
         return median
+
+
+def _gpd_interval_bounds(mu, sigma, xi):
+    """Symbolic ``(lower, upper)`` support bounds for the GPD family.
+
+    Lower bound is the threshold ``mu``. The upper bound is the finite right
+    endpoint ``mu - sigma / xi`` when ``xi < 0`` and ``+inf`` otherwise; the
+    ``Interval`` transform treats a ``+inf`` edge as one-sided, so a single
+    expression covers both the heavy (``xi >= 0``) and bounded (``xi < 0``)
+    regimes -- including when ``mu``, ``sigma`` or ``xi`` are themselves random.
+    """
+    return mu, pt.switch(pt.lt(xi, 0), mu - sigma / xi, np.inf)
+
+
+@_default_transform.register(GenPareto)
+def _genpareto_default_transform(op, rv):
+    # rv inputs: (rng, size, mu, sigma, xi)
+    return Interval(bounds_fn=lambda *inputs: _gpd_interval_bounds(*inputs[2:5]))
+
+
+@_default_transform.register(ExtGenPareto)
+def _extgenpareto_default_transform(op, rv):
+    # rv inputs: (rng, size, mu, sigma, xi, kappa) -- bounds ignore kappa
+    return Interval(bounds_fn=lambda *inputs: _gpd_interval_bounds(*inputs[2:5]))
