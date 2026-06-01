@@ -846,10 +846,21 @@ class GenPareto(Continuous):
     rv_op = GenParetoRV.rv_op
 
     @classmethod
-    def dist(cls, mu=0, sigma=1, xi=0, **kwargs):
+    def dist(cls, mu=0, sigma=None, xi=0, *, upper=None, **kwargs):
+        # Optional bounded-tail reparameterization: give the upper wall directly
+        # (xi < 0). sigma = (upper - mu) * (-xi) pins ``mu - sigma/xi == upper``,
+        # turning the parameter-dependent support edge into a plain bound on
+        # ``upper`` -- which is what lets a peaks-over-threshold fit sample without
+        # boundary divergences. See the Notes on numerical precision.
         mu = pt.as_tensor_variable(floatX(mu))
-        sigma = pt.as_tensor_variable(floatX(sigma))
         xi = pt.as_tensor_variable(floatX(xi))
+        if upper is not None:
+            if sigma is not None:
+                raise ValueError("Specify either `sigma` or `upper`, not both.")
+            sigma = (pt.as_tensor_variable(floatX(upper)) - mu) * (-xi)
+        elif sigma is None:
+            sigma = 1.0
+        sigma = pt.as_tensor_variable(floatX(sigma))
         return super().dist([mu, sigma, xi], **kwargs)
 
     def logp(value, mu, sigma, xi):
@@ -995,10 +1006,18 @@ class ExtGenPareto(Continuous):
     rv_op = ExtGenParetoRV.rv_op
 
     @classmethod
-    def dist(cls, mu=0, sigma=1, xi=0, kappa=1, **kwargs):
+    def dist(cls, mu=0, sigma=None, xi=0, kappa=1, *, upper=None, **kwargs):
+        # ``upper`` reparameterizes by the bounded (xi < 0) upper wall, as for
+        # GenPareto: sigma = (upper - mu) * (-xi). Stabilizes boundary fits.
         mu = pt.as_tensor_variable(floatX(mu))
-        sigma = pt.as_tensor_variable(floatX(sigma))
         xi = pt.as_tensor_variable(floatX(xi))
+        if upper is not None:
+            if sigma is not None:
+                raise ValueError("Specify either `sigma` or `upper`, not both.")
+            sigma = (pt.as_tensor_variable(floatX(upper)) - mu) * (-xi)
+        elif sigma is None:
+            sigma = 1.0
+        sigma = pt.as_tensor_variable(floatX(sigma))
         kappa = pt.as_tensor_variable(floatX(kappa))
         return super().dist([mu, sigma, xi, kappa], **kwargs)
 
