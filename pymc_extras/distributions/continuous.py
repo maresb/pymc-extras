@@ -621,13 +621,27 @@ def ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa):
     return _propagate_nonfinite_shape(logsf, xi)
 
 
+def _ext_gpd_excess_from_log_prob(log_q, kappa):
+    """GPD excess ``m = -log(1 - F ** (1/kappa))`` from ``log_q = log F``.
+
+    For the carrier ``F = H ** kappa``, the GPD CDF is ``H = exp(log_q / kappa)``
+    and its survival ``1 - H``, so ``m = -log(1 - H) = -log1mexp(log_q / kappa)``
+    (``pt.log1mexp(a) = log(1 - exp(a))`` for ``a <= 0``). Using ``log1mexp`` -- its
+    ``log1p`` branch -- instead of ``-log(-expm1(.))`` keeps ``m`` exact when ``H``
+    rounds to ``1``: for small ``kappa`` the survival ``1 - H`` is tiny and the
+    naive form collapses the excess to ``0`` (and the quantile to ``mu``). Shared
+    by the quantile, the sampler, ``support_point`` and the default transform so
+    all four inverses agree. ``log_q`` must be ``<= 0`` (a log-probability).
+    """
+    return -pt.log1mexp(log_q / kappa)
+
+
 def ext_gen_pareto_icdf(value, mu, sigma, xi, kappa):
     """Pure-PyTensor extended-GPD quantile function (assumes ``0 <= value <= 1``)."""
     value = pt.as_tensor_variable(value)
-    # F = H ** kappa = q  ->  H = q ** (1/kappa); the GPD excess is -log(1 - H),
-    # and 1 - H = -expm1(log(q)/kappa) (stable as q ** (1/kappa) -> 1).
-    gpd_survival = -pt.expm1(pt.log(value) / kappa)
-    excess = -pt.log(gpd_survival)
+    # F = H ** kappa = q  ->  H = q ** (1/kappa); excess m = -log(1 - H), built
+    # with log1mexp so a tiny 1 - H (small kappa) is not rounded away to 0.
+    excess = _ext_gpd_excess_from_log_prob(pt.log(value), kappa)
     x = _gpd_quantile_from_excess(excess, mu, sigma, xi)
     x = pt.switch(pt.eq(value, 1), _gpd_upper_bound(mu, sigma, xi), x)
     return pt.switch(pt.eq(value, 0), mu, x)
@@ -677,8 +691,9 @@ class ExtGenParetoRV(SymbolicRandomVariable):
         if rv_size_is_none(size):
             size = implicit_size_from_params(mu, sigma, xi, kappa, ndims_params=cls.ndims_params)
         next_rng, u = _uniform_draw(size, rng)
-        # GPD survival of the carrier draw: 1 - u ** (1/kappa) = -expm1(log u / kappa).
-        excess = -pt.log(-pt.expm1(pt.log(u) / kappa))
+        # Carrier draw u = F; excess = -log(1 - u ** (1/kappa)), via log1mexp so
+        # small-kappa draws do not collapse to the lower endpoint (1 - u**.. -> 1).
+        excess = _ext_gpd_excess_from_log_prob(pt.log(u), kappa)
         draws = _gpd_quantile_from_excess(excess, mu, sigma, xi)
         return cls(inputs=[rng, size, mu, sigma, xi, kappa], outputs=[next_rng, draws])(
             rng, size, mu, sigma, xi, kappa
@@ -969,9 +984,11 @@ class ExtGenPareto(Continuous):
         return check_icdf_parameters(res, sigma > 0, kappa > 0, msg="sigma > 0, kappa > 0")
 
     def support_point(rv, size, mu, sigma, xi, kappa):
-        # Median solves H(m) ** kappa = 1/2, i.e. the ExtGPD quantile at 1/2.
-        gpd_survival = -pt.expm1(np.log(0.5) / kappa)
-        median = _gpd_quantile_from_excess(-pt.log(gpd_survival), mu, sigma, xi)
+        # Median solves H(m) ** kappa = 1/2, i.e. the ExtGPD quantile at 1/2; the
+        # log1mexp form keeps it off mu for small kappa (where 1 - 0.5 ** (1/kappa)
+        # underflows, collapsing the naive median to mu and the init logp to -inf).
+        excess = _ext_gpd_excess_from_log_prob(np.log(0.5), kappa)
+        median = _gpd_quantile_from_excess(excess, mu, sigma, xi)
         if not rv_size_is_none(size):
             median = pt.full(size, median)
         return median
@@ -1094,15 +1111,11 @@ class _ExtGenParetoPIT(_GPDProbabilityIntegralTransform):
     def _excess_from_y(value, mu, sigma, xi, kappa):
         # m = -log(S_F), the GPD-survival exponent, recovered from y = logit(F_ext).
         #
-        # Bulk (value < 700): the ExtGPD carrier H = F_ext ** (1 / kappa) gives GPD
-        # survival S_F = 1 - H, so m = -log(S_F) = -log1mexp(log F_ext / kappa) with
-        # log F_ext = -softplus(-y) (pt.log1mexp(a) = log(1 - exp(a)) for a <= 0).
-        # Using log1mexp -- whose log1p branch never forms ``1 - H`` -- keeps m exact
-        # when S_F is tiny: for small kappa H rounds to 1, and ``-log(-expm1(.))``
-        # would collapse the excess to 0, but log1mexp returns the true ~e^{-Q}.
-        # This is the exact inverse, so it round-trips for every kappa down to where
-        # H itself underflows (the heavy carrier needs ~e^{-|y|} headroom in kappa;
-        # see the class docstring's kappa note).
+        # Bulk (value < 700): m = -log(1 - F_ext ** (1/kappa)) from log F_ext =
+        # -softplus(-y), via the shared log1mexp inverse so a tiny GPD survival (the
+        # small-kappa regime) is not rounded away to 0. Exact, so it round-trips for
+        # every kappa down to where the carrier underflows (see the class docstring's
+        # kappa note).
         #
         # Tail (value >= 700): log F_ext = -softplus(-y) rounds to 0 near y ~ 745,
         # sending m -> inf though the quantile is finite. There S_ext = exp(-t) is
@@ -1113,7 +1126,7 @@ class _ExtGenParetoPIT(_GPDProbabilityIntegralTransform):
         # clamped inputs so the discarded one (and its gradient) stays finite.
         t = pt.softplus(value)
         log_F = -pt.softplus(-pt.minimum(value, 700.0))
-        m_bulk = -pt.log1mexp(log_F / kappa)
+        m_bulk = _ext_gpd_excess_from_log_prob(log_F, kappa)
         s = pt.exp(-pt.maximum(t, 700.0))
         m_tail = t + pt.log(kappa) - pt.log(_log1p_div(-s))
         return pt.switch(value < 700.0, m_bulk, m_tail)
