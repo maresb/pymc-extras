@@ -504,6 +504,23 @@ def gen_pareto_logcdf(value, mu, sigma, xi):
     return pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
 
 
+def gen_pareto_logccdf(value, mu, sigma, xi):
+    """Pure-PyTensor GPD log complementary CDF (log survival function).
+
+    The survival exponent ``m`` is computed directly, so this is exact and stable
+    in the heavy upper tail -- the regime where the generic
+    ``log1mexp(logcdf)`` fallback collapses (``logcdf -> 0`` there). This is the
+    natural ``logsf`` primitive for a peaks-over-threshold model.
+    """
+    z = (value - mu) / sigma
+    logsf = -(z * _log1p_div(_safe_mul(xi, z)))  # log S = -m
+    # For xi < 0 past the finite upper endpoint, and at the +inf tail, S = 0.
+    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + _safe_mul(xi, z), 0))
+    logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
+    # Below mu the survival is 1 (logsf 0).
+    return pt.switch(z < 0, 0.0, logsf)
+
+
 def gen_pareto_icdf(value, mu, sigma, xi):
     """Pure-PyTensor GPD quantile function (assumes ``0 <= value <= 1``)."""
     value = pt.as_tensor_variable(value)
@@ -540,6 +557,19 @@ def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
     logcdf = pt.switch(above_upper, 0.0, kappa * _gpd_log_H(z, xi))
     logcdf = pt.switch(z >= 0, logcdf, -np.inf)
     return pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
+
+
+def ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa):
+    """Pure-PyTensor extended-GPD log complementary CDF (log survival function).
+
+    ``S = 1 - H ** kappa``; ``log S = log1mexp(kappa * log H)``. The upper tail is
+    the GPD tail, so this inherits the GPD survival's tail stability.
+    """
+    z = (value - mu) / sigma
+    logsf = pt.log1mexp(kappa * _gpd_log_H(z, xi))
+    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + _safe_mul(xi, z), 0))
+    logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
+    return pt.switch(z < 0, 0.0, logsf)
 
 
 def ext_gen_pareto_icdf(value, mu, sigma, xi, kappa):
@@ -649,7 +679,15 @@ class GenPareto(Continuous):
               * :math:`\infty`, when :math:`\xi \geq 1`
     Variance  * :math:`\sigma^2 / ((1 - \xi)^2 (1 - 2\xi))`, when :math:`\xi < 1/2`
               * :math:`\infty`, when :math:`\xi \geq 1/2`
+    Median    :math:`\mu + \sigma (2^{\xi} - 1) / \xi` (:math:`\mu + \sigma \ln 2`
+              at :math:`\xi = 0`)
+    Mode      :math:`\mu`
+    Entropy   :math:`\ln \sigma + \xi + 1`
     ========  =========================================================================
+
+    The ``support_point`` (used to initialise sampling) is the median, which is
+    finite for every :math:`\xi` -- unlike the mean, which diverges for
+    :math:`\xi \geq 1`.
 
     Parameters
     ----------
@@ -711,6 +749,11 @@ class GenPareto(Continuous):
     def logcdf(value, mu, sigma, xi):
         return check_parameters(gen_pareto_logcdf(value, mu, sigma, xi), sigma > 0, msg="sigma > 0")
 
+    def logccdf(value, mu, sigma, xi):
+        return check_parameters(
+            gen_pareto_logccdf(value, mu, sigma, xi), sigma > 0, msg="sigma > 0"
+        )
+
     def icdf(value, mu, sigma, xi):
         res = gen_pareto_icdf(value, mu, sigma, xi)
         res = check_icdf_value(res, value)
@@ -763,7 +806,25 @@ class ExtGenPareto(Continuous):
     ========  =========================================================================
     Support   * :math:`x \geq \mu`, when :math:`\xi \geq 0`
               * :math:`\mu \leq x \leq \mu - \sigma/\xi`, when :math:`\xi < 0`
+    Mean      :math:`\mu + \frac{\sigma}{\xi}\left[\kappa B(\kappa, 1 - \xi) - 1\right]`,
+              when :math:`\xi < 1`
+    Variance  :math:`\left(\frac{\sigma}{\xi}\right)^2
+              \left[\kappa B(\kappa, 1 - 2\xi) - 2\kappa B(\kappa, 1 - \xi) + 1\right]
+              - (\text{Mean} - \mu)^2`, when :math:`\xi < 1/2`
+    Median    :math:`Q\!\left(2^{-1/\kappa}\right)`, the GPD quantile (see
+              :class:`GenPareto`) at survival probability :math:`2^{-1/\kappa}`
+    Mode      * :math:`\mu + \frac{\sigma}{\xi}\left[(T^\star)^{-\xi} - 1\right]`,
+              :math:`T^\star = \frac{1 + \xi}{\kappa + \xi}`, when :math:`\kappa > 1`
+              * :math:`\mu`, when :math:`\kappa \leq 1`
     ========  =========================================================================
+
+    Here :math:`B(a, b) = \Gamma(a)\Gamma(b)/\Gamma(a + b)` is the Beta function;
+    the :math:`r`-th central moment exists iff :math:`\xi < 1/r`, exactly as for
+    the GPD. As :math:`\xi \to 0` the mean tends to
+    :math:`\mu + \sigma(\psi(\kappa + 1) + \gamma)` (digamma :math:`\psi`,
+    Euler--Mascheroni :math:`\gamma`) and the variance to
+    :math:`\sigma^2(\pi^2/6 - \psi'(\kappa + 1))`. The ``support_point`` is the
+    median (finite for all :math:`\xi`).
 
     Parameters
     ----------
@@ -830,6 +891,14 @@ class ExtGenPareto(Continuous):
     def logcdf(value, mu, sigma, xi, kappa):
         return check_parameters(
             ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa),
+            sigma > 0,
+            kappa > 0,
+            msg="sigma > 0, kappa > 0",
+        )
+
+    def logccdf(value, mu, sigma, xi, kappa):
+        return check_parameters(
+            ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa),
             sigma > 0,
             kappa > 0,
             msg="sigma > 0, kappa > 0",
