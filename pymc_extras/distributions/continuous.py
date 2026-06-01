@@ -984,14 +984,22 @@ class ExtGenPareto(Continuous):
         return check_icdf_parameters(res, sigma > 0, kappa > 0, msg="sigma > 0, kappa > 0")
 
     def support_point(rv, size, mu, sigma, xi, kappa):
-        # Median solves H(m) ** kappa = 1/2, i.e. the ExtGPD quantile at 1/2; the
-        # log1mexp form keeps it off mu for small kappa (where 1 - 0.5 ** (1/kappa)
-        # underflows, collapsing the naive median to mu and the init logp to -inf).
+        # The ExtGPD median solves H(m) ** kappa = 1/2 (carrier H = 0.5 ** (1/kappa)),
+        # recovered with the shared log1mexp inverse. For small kappa that carrier is
+        # so close to 0 that the median is sub-ULP from mu and rounds onto it, which
+        # transforms to a -inf initial point. A support point only has to be a usable
+        # initialization, so when the median collapses to mu fall back to the
+        # underlying GPD median (carrier H = 1/2, excess = log 2) -- a higher ExtGPD
+        # quantile (F = 0.5 ** kappa) that is representably interior, mu + O(sigma),
+        # for any kappa, hence has a finite transformed logp. At kappa = 1 the two
+        # coincide, so ordinary kappa is unchanged.
         excess = _ext_gpd_excess_from_log_prob(np.log(0.5), kappa)
         median = _gpd_quantile_from_excess(excess, mu, sigma, xi)
+        gpd_median = _gpd_quantile_from_excess(np.log(2.0), mu, sigma, xi)
+        point = pt.switch(pt.le(median, mu), gpd_median, median)
         if not rv_size_is_none(size):
-            median = pt.full(size, median)
-        return median
+            point = pt.full(size, point)
+        return point
 
 
 class _GPDProbabilityIntegralTransform(Transform):
@@ -1049,7 +1057,11 @@ class _GPDProbabilityIntegralTransform(Transform):
     kappa)`` -- well past where a sampler goes for ordinary shape values. For
     ``kappa`` smaller than that the carrier underflows and the excess rounds
     toward ``0`` (``x -> mu``, still *in support*, transformed logp ``-> -inf``);
-    it never leaves the support.
+    it never leaves the support. The *initial* point is unaffected by this floor:
+    ``ExtGenPareto.support_point`` falls back to a higher quantile when the median
+    rounds onto ``mu``, so the default transform yields a finite starting logp for
+    every ``kappa > 0`` (the ``forward`` map is built from ``logcdf - logccdf`` in
+    log space, so it stays finite even where ``F`` itself rounds to ``1``).
 
     Subclasses provide the family's ``_logp`` / ``_logcdf`` / ``_logccdf`` and the
     survival-space ``_excess_from_y``; ``inputs`` are the RV's owner inputs, so
