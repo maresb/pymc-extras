@@ -487,16 +487,18 @@ def _in_gpd_support(z, xi):
     return pt.and_(z >= 0, 1 + _safe_mul(xi, z) > 0)
 
 
-def _propagate_nonfinite_shape(result, z, xi):
-    """Map ``result`` to ``nan`` wherever ``xi`` (hence ``1 + xi z``) is non-finite.
+def _propagate_nonfinite_shape(result, xi):
+    """Map ``result`` to ``nan`` wherever the shape ``xi`` is non-finite.
 
     The support / boundary ``switch`` masks below mask out-of-support values to
-    ``-inf`` / ``0``; without this a ``nan`` shape would be silently turned into
-    one of those ("valid parameter, impossible value", which is a lie). ``nan``
-    in -> ``nan`` out, consistently across logp / logcdf / logccdf and matching
-    how pymc's own distributions propagate a non-finite parameter.
+    ``-inf`` / ``0``; without this a non-finite shape would be silently turned
+    into one of those ("valid parameter, impossible value", which is a lie).
+    Keyed on ``isfinite(xi)`` directly -- not on ``1 + xi z`` -- so it fires for
+    ``xi = nan`` and ``xi = +-inf`` at *every* value, including ``x = mu`` (where
+    ``z = 0`` makes ``1 + xi z`` finite). ``nan``/``inf`` shape in -> ``nan``
+    out, consistently across logp / logcdf / logccdf.
     """
-    return pt.switch(pt.isnan(1 + _safe_mul(xi, z)), np.nan, result)
+    return pt.switch(pt.isfinite(xi), result, np.nan)
 
 
 # The ``gen_pareto_*`` / ``ext_gen_pareto_*`` builders below are pure PyTensor:
@@ -514,7 +516,7 @@ def gen_pareto_logp(value, mu, sigma, xi):
     # in-support branch would evaluate log1p(inf)/inf -> nan there, so pin
     # z = +inf to -inf explicitly.
     logp = pt.switch(pt.eq(z, np.inf), -np.inf, logp)
-    return _propagate_nonfinite_shape(logp, z, xi)
+    return _propagate_nonfinite_shape(logp, xi)
 
 
 def gen_pareto_logcdf(value, mu, sigma, xi):
@@ -527,7 +529,7 @@ def gen_pareto_logcdf(value, mu, sigma, xi):
     logcdf = pt.switch(z >= 0, logcdf, -np.inf)
     # CDF -> 1 (logcdf 0) at the +inf tail; for xi > 0 _gpd_log_H(inf) is nan.
     logcdf = pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
-    return _propagate_nonfinite_shape(logcdf, z, xi)
+    return _propagate_nonfinite_shape(logcdf, xi)
 
 
 def gen_pareto_logccdf(value, mu, sigma, xi):
@@ -545,7 +547,7 @@ def gen_pareto_logccdf(value, mu, sigma, xi):
     logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
     # Below mu the survival is 1 (logsf 0).
     logsf = pt.switch(z < 0, 0.0, logsf)
-    return _propagate_nonfinite_shape(logsf, z, xi)
+    return _propagate_nonfinite_shape(logsf, xi)
 
 
 def gen_pareto_icdf(value, mu, sigma, xi):
@@ -575,7 +577,7 @@ def ext_gen_pareto_logp(value, mu, sigma, xi, kappa):
     logp = pt.log(kappa) + carrier + _gpd_log_h(z, sigma, xi)
     logp = pt.switch(_in_gpd_support(z, xi), logp, -np.inf)
     logp = pt.switch(pt.eq(z, np.inf), -np.inf, logp)
-    return _propagate_nonfinite_shape(logp, z, xi)
+    return _propagate_nonfinite_shape(logp, xi)
 
 
 def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
@@ -585,7 +587,7 @@ def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
     logcdf = pt.switch(above_upper, 0.0, kappa * _gpd_log_H(z, xi))
     logcdf = pt.switch(z >= 0, logcdf, -np.inf)
     logcdf = pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
-    return _propagate_nonfinite_shape(logcdf, z, xi)
+    return _propagate_nonfinite_shape(logcdf, xi)
 
 
 def ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa):
@@ -616,7 +618,7 @@ def ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa):
     above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + _safe_mul(xi, z), 0))
     logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
     logsf = pt.switch(z < 0, 0.0, logsf)
-    return _propagate_nonfinite_shape(logsf, z, xi)
+    return _propagate_nonfinite_shape(logsf, xi)
 
 
 def ext_gen_pareto_icdf(value, mu, sigma, xi, kappa):
@@ -992,16 +994,26 @@ class _GPDProbabilityIntegralTransform(Transform):
     every parameter (no kink anywhere), while the inverse enforces the correct
     support -- including the moving upper wall -- for all xi.
 
-    Everything is done in survival / log space so it never materialises a
-    saturated probability: ``sigmoid(y)`` rounds to exactly ``1`` for ``y >= 37``
-    in float64, and feeding that into the quantile gives ``inf``/``nan`` on
-    perfectly valid unconstrained values. Instead ``backward`` builds the GPD
-    excess ``m = -log(survival)`` directly from ``y`` (``softplus(y)`` for the
-    base family), and ``log_jac_det`` uses the analytic
+    The map is built in survival / log space so it never materialises a
+    *saturated probability*: ``sigmoid(y)`` rounds to exactly ``1`` for
+    ``y >= 37`` in float64, and feeding that into the quantile gives ``inf`` /
+    ``nan`` on perfectly valid unconstrained values. ``backward`` instead builds
+    the GPD excess ``m = -log(survival)`` directly from ``y`` (``softplus(y)``
+    for the base family), and ``log_jac_det`` uses the analytic
     ``log F + log S - logp(x)`` rather than autodiffing the quantile graph.
-    Verified: the transformed density is exactly Logistic (xi-free) and finite
-    out to ``|y| = 100``, ``forward(backward(y)) == y``, and divergences fall to
-    ~0 across xi < 0, xi = 0 and xi > 0.
+
+    Range of validity. PyMC adds ``logp(backward(y))`` to ``log_jac_det(y)``, so
+    the map is only as good as the quantile ``x = backward(y)`` is
+    *representable*. For a light or exponential upper tail (``xi <= 0``) ``x``
+    grows at most linearly in ``y`` and the map is exact essentially everywhere
+    (verified past ``|y| = 1000``). For a heavy upper tail it grows like
+    ``exp(xi * m)``, so ``x`` overflows ``float64`` at roughly ``y ~ 709 / xi``
+    (e.g. ``y ~ 142`` for ``xi = 5``); the bounded ``xi < 0`` case is limited the
+    other way by the wall's ULP at ``|y| ~ 60``. Beyond those points the
+    transformed logp is ``-inf`` / ``nan``. These bounds are far past any
+    sampler's reach (``y = 60`` is a tail probability of ``~e^-60``), and the
+    transformed density is exactly Logistic (xi-free) and divergence-free within
+    them -- but the map is *not* finite on all of ``R`` for every parameter.
 
     Subclasses provide the family's ``_logp`` / ``_logcdf`` / ``_logccdf`` and the
     survival-space ``_excess_from_y``; ``inputs`` are the RV's owner inputs, so

@@ -535,21 +535,25 @@ class TestGenParetoBoundaries:
             with pytest.raises(ParameterValueError):
                 pm.logp(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.1, kappa=kappa), 1.0).eval()
 
-    def test_nan_xi_propagates_consistently(self):
-        # A non-finite ``xi`` must propagate as ``nan`` -- not be masked to the
-        # ``-inf`` of an out-of-support value ("valid parameter, impossible
-        # value", which is a lie), and not be silently turned into the xi = 0
-        # exponential branch. logp, logcdf and logccdf must all agree on nan.
-        x = 1.0
-        # sanity: the xi = 0 branch is finite here, so a masked -inf would hide it
-        assert np.isfinite(pm.logp(GenPareto.dist(mu=0.0, sigma=1.0, xi=0.0), x).eval())
+    @pytest.mark.parametrize("bad_xi", [np.nan, np.inf, -np.inf])
+    def test_nonfinite_xi_propagates_consistently(self, bad_xi):
+        # A non-finite ``xi`` must propagate as ``nan`` at *every* value -- not be
+        # masked to the ``-inf`` / ``0`` of an out-of-support point ("valid
+        # parameter, impossible value", which is a lie), and not be silently
+        # turned into the xi = 0 exponential branch. This must hold even at
+        # ``x = mu`` (where ``z = 0`` makes ``1 + xi z`` finite) and for
+        # ``xi = +-inf``, so the guard keys on ``isfinite(xi)`` directly.
+        # sanity: the xi = 0 branch is finite at x = 1, so a masked -inf would hide it
+        assert np.isfinite(pm.logp(GenPareto.dist(mu=0.0, sigma=1.0, xi=0.0), 1.0).eval())
         for dist in (
-            GenPareto.dist(mu=0.0, sigma=1.0, xi=np.nan),
-            ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=np.nan, kappa=2.0),
+            GenPareto.dist(mu=0.0, sigma=1.0, xi=bad_xi),
+            ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=bad_xi, kappa=2.0),
         ):
-            assert np.isnan(pm.logp(dist, x).eval())
-            assert np.isnan(pm.logcdf(dist, x).eval())
-            assert np.isnan(pm.logccdf(dist, x).eval())
+            # in support (x=1), at the lower endpoint (x=mu=0), below (x=-1), above (+inf)
+            for x in (1.0, 0.0, -1.0, np.inf):
+                assert np.isnan(pm.logp(dist, x).eval())
+                assert np.isnan(pm.logcdf(dist, x).eval())
+                assert np.isnan(pm.logccdf(dist, x).eval())
 
 
 class TestGenParetoHeavyTail:
@@ -708,26 +712,50 @@ class TestGenParetoTransforms:
             np.testing.assert_allclose(float(roundtrip(y)), y, atol=1e-6)
 
     @pytest.mark.parametrize(
-        "dist_kwargs, builder",
+        "dist_kwargs, builder, y_max",
         [
-            ({"mu": 0.0, "sigma": 1.0, "xi": 0.3}, GenPareto),
-            ({"mu": 0.0, "sigma": 1.0, "xi": 0.0}, GenPareto),
-            ({"mu": 0.0, "sigma": 1.0, "xi": 0.3, "kappa": 2.0}, ExtGenPareto),
+            # Exponential tail (xi = 0, unbounded, no overflow): exact very far out.
+            ({"mu": 0.0, "sigma": 1.0, "xi": 0.0}, GenPareto, 1000.0),
+            ({"mu": 0.0, "sigma": 1.0, "xi": 0.0, "kappa": 2.0}, ExtGenPareto, 700.0),
+            # Mild heavy tail: the quantile ~ exp(xi * m) overflows only at
+            # y ~ 709 / xi, so 400 is well inside.
+            ({"mu": 0.0, "sigma": 1.0, "xi": 0.3}, GenPareto, 400.0),
+            ({"mu": 0.0, "sigma": 1.0, "xi": 0.3, "kappa": 2.0}, ExtGenPareto, 400.0),
         ],
     )
-    def test_unbounded_transform_is_finite_arbitrarily_far(self, dist_kwargs, builder):
-        # For xi >= 0 there is no upper wall, so the transform must stay finite
-        # and Logistic at arbitrarily large |y| (a quantile only overflows to inf
-        # near the float64 ceiling, far past any sampler's reach).
+    def test_transform_exact_deep_into_the_tail(self, dist_kwargs, builder, y_max):
+        # Where the quantile is representable, the transformed density is exactly
+        # Logistic arbitrarily far out (xi >= 0 has no upper wall; the heavy-tail
+        # cases stay below the y ~ 709 / xi overflow boundary).
         with pm.Model() as model:
             builder("x", **dist_kwargs)
         yv = model.value_vars[0]
         transformed_logp = pytensor.function([yv], model.logp(sum=True))
-        for y in (100.0, 200.0, 400.0):
+        for y in (100.0, y_max / 2, y_max):
             lp = float(transformed_logp(y))
             logistic = -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y)
             assert np.isfinite(lp)
             np.testing.assert_allclose(lp, logistic, atol=1e-6)
+
+    @pytest.mark.parametrize("xi", [5.0, 3.0])
+    def test_heavy_tail_transform_overflows_only_past_709_over_xi(self, xi):
+        # Honest bound, not an over-claim: for a heavy upper tail the quantile
+        # x = backward(y) ~ exp(xi * m) overflows float64 around y ~ 709 / xi.
+        # The transform is exact a comfortable margin below that boundary (which
+        # is itself a tail probability of ~e^-(709/xi), unreachable in practice),
+        # and -inf beyond it -- a representability limit on x, not a bug.
+        with pm.Model() as model:
+            GenPareto("x", mu=0.0, sigma=1.0, xi=xi)
+        yv = model.value_vars[0]
+        transformed_logp = pytensor.function([yv], model.logp(sum=True))
+        boundary = 709.0 / xi
+        y_inside = boundary * 0.8
+        lp = float(transformed_logp(y_inside))
+        np.testing.assert_allclose(
+            lp, -np.logaddexp(0.0, y_inside) - np.logaddexp(0.0, -y_inside), atol=1e-6
+        )
+        # Past the float64 ceiling the quantile is +inf, so the logp is not finite.
+        assert not np.isfinite(float(transformed_logp(boundary * 1.5)))
 
     def test_jacobian_gradient_is_continuous_through_xi_zero(self):
         # The headline reason for the probability-integral transform: with xi a
