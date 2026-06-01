@@ -535,21 +535,21 @@ class TestGenParetoBoundaries:
             with pytest.raises(ParameterValueError):
                 pm.logp(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.1, kappa=kappa), 1.0).eval()
 
-    def test_nan_xi_does_not_become_exponential(self):
-        # ``_safe_mul`` repairs only the indeterminate ``0 * inf``; a genuine
-        # nan ``xi`` must NOT be silently turned into the xi = 0 (exponential)
-        # branch. The exact non-finite value (nan vs -inf from the support mask)
-        # is unimportant -- what matters is it never equals the xi = 0 result.
+    def test_nan_xi_propagates_consistently(self):
+        # A non-finite ``xi`` must propagate as ``nan`` -- not be masked to the
+        # ``-inf`` of an out-of-support value ("valid parameter, impossible
+        # value", which is a lie), and not be silently turned into the xi = 0
+        # exponential branch. logp, logcdf and logccdf must all agree on nan.
         x = 1.0
-        exp_logp = float(pm.logp(GenPareto.dist(mu=0.0, sigma=1.0, xi=0.0), x).eval())
-        nan_logp = float(pm.logp(GenPareto.dist(mu=0.0, sigma=1.0, xi=np.nan), x).eval())
-        assert np.isfinite(exp_logp)  # sanity: the xi=0 branch is finite here
-        assert not np.isfinite(nan_logp)  # nan xi must not yield a finite value
-        assert nan_logp != exp_logp
-        ext_nan = float(
-            pm.logp(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=np.nan, kappa=2.0), x).eval()
-        )
-        assert not np.isfinite(ext_nan)
+        # sanity: the xi = 0 branch is finite here, so a masked -inf would hide it
+        assert np.isfinite(pm.logp(GenPareto.dist(mu=0.0, sigma=1.0, xi=0.0), x).eval())
+        for dist in (
+            GenPareto.dist(mu=0.0, sigma=1.0, xi=np.nan),
+            ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=np.nan, kappa=2.0),
+        ):
+            assert np.isnan(pm.logp(dist, x).eval())
+            assert np.isnan(pm.logcdf(dist, x).eval())
+            assert np.isnan(pm.logccdf(dist, x).eval())
 
 
 class TestGenParetoHeavyTail:
@@ -600,6 +600,63 @@ class TestGenParetoHeavyTail:
             ExtGenPareto("x", mu=mu, sigma=sigma, xi=xi, kappa=kappa)
         expected = ref_ext_icdf(0.5, mu, sigma, xi, kappa)
         assert_support_point_is_expected(model, expected)
+
+    def test_ext_logccdf_stable_in_far_tail(self):
+        # ExtGPD survival = 1 - H**kappa. Routing through log H collapses to -inf
+        # once H rounds to 1 in the far tail; the direct survival path stays
+        # exact. For the exponential base (xi=0) the tail value is log(kappa) - x.
+        for kappa in (0.5, 1.0, 2.5, 5.0):
+            x = np.array([100.0, 300.0, 1000.0])
+            got = pm.logccdf(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.0, kappa=kappa), x).eval()
+            assert np.all(np.isfinite(got))
+            np.testing.assert_allclose(got, np.log(kappa) - x, rtol=1e-9)
+
+
+class TestGenParetoTransforms:
+    """Both distributions register a default Interval transform.
+
+    Without it, an unobserved (latent) GPD variable would be sampled on all of
+    R, where every proposal below mu has -inf logp -- breaking NUTS. The
+    transform maps to the (parameter-dependent) support, so sampling stays valid
+    for both the heavy (xi >= 0) and bounded (xi < 0) regimes.
+    """
+
+    pytestmark = _GPD_FPE_FILTERS
+
+    def test_default_transform_is_registered(self):
+        with pm.Model() as model:
+            x = GenPareto("x", mu=5.0, sigma=1.0, xi=0.3)
+            e = ExtGenPareto("e", mu=2.0, sigma=1.0, xi=-0.4, kappa=2.0)
+        assert model.rvs_to_transforms[x] is not None
+        assert model.rvs_to_transforms[e] is not None
+
+    @pytest.mark.parametrize(
+        "xi, mu, sigma",
+        [(0.3, 5.0, 1.0), (0.0, 0.0, 2.0), (-0.5, 0.0, 1.0)],
+    )
+    def test_latent_sampling_stays_in_support(self, xi, mu, sigma):
+        with pm.Model() as model:
+            GenPareto("x", mu=mu, sigma=sigma, xi=xi)
+            idata = pm.sample(
+                200,
+                tune=300,
+                chains=2,
+                progressbar=False,
+                random_seed=1,
+                compute_convergence_checks=False,
+            )
+        xs = idata.posterior["x"].values
+        assert np.all(xs >= mu - 1e-9)
+        if xi < 0:
+            assert np.all(xs <= mu - sigma / xi + 1e-9)  # finite upper wall
+        assert int(idata.sample_stats.diverging.values.sum()) == 0
+
+    def test_observed_is_unaffected(self):
+        # Observed data is fixed, so the transform must not change its logp.
+        data = np.array([6.0, 7.0, 8.0])
+        with pm.Model() as model:
+            GenPareto("obs", mu=5.0, sigma=1.0, xi=0.2, observed=data)
+        assert np.isfinite(model.compile_logp()({}))
 
 
 class TestGenParetoSmoothShapeLimit:
