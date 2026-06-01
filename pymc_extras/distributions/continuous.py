@@ -1004,16 +1004,25 @@ class _GPDProbabilityIntegralTransform(Transform):
 
     Range of validity. PyMC adds ``logp(backward(y))`` to ``log_jac_det(y)``, so
     the map is only as good as the quantile ``x = backward(y)`` is
-    *representable*. For a light or exponential upper tail (``xi <= 0``) ``x``
-    grows at most linearly in ``y`` and the map is exact essentially everywhere
-    (verified past ``|y| = 1000``). For a heavy upper tail it grows like
-    ``exp(xi * m)``, so ``x`` overflows ``float64`` at roughly ``y ~ 709 / xi``
-    (e.g. ``y ~ 142`` for ``xi = 5``); the bounded ``xi < 0`` case is limited the
-    other way by the wall's ULP at ``|y| ~ 60``. Beyond those points the
-    transformed logp is ``-inf`` / ``nan``. These bounds are far past any
-    sampler's reach (``y = 60`` is a tail probability of ``~e^-60``), and the
-    transformed density is exactly Logistic (xi-free) and divergence-free within
-    them -- but the map is *not* finite on all of ``R`` for every parameter.
+    *representable*. The upper tail sets the limit and depends on ``xi``:
+
+    * ``xi == 0`` (exponential upper tail): ``x`` grows linearly, ``x ~ mu +
+      sigma * y``, so the map is exact essentially everywhere -- verified past
+      ``|y| = 1000`` -- until ``y`` itself overflows ``float64``.
+    * ``xi > 0`` (heavy upper tail): ``x ~ exp(xi * m)`` overflows ``float64`` at
+      roughly ``y ~ 709 / xi`` (e.g. ``y ~ 142`` for ``xi = 5``).
+    * ``xi < 0`` (bounded support ``[mu, mu - sigma/xi)``): ``x`` asymptotes to
+      the upper wall and the round-trip is limited by the wall's ULP at
+      ``|y| ~ 60``.
+
+    Beyond those points the transformed logp is ``-inf`` / ``nan``. For
+    ``ExtGenPareto`` the excess is recovered from the survival side with a tail
+    asymptotic (see ``_ExtGenParetoPIT._excess_from_y``), so its reach matches the
+    base family rather than underflowing early near ``y ~ 745``. All of these
+    bounds are far past any sampler's reach (``y = 60`` is a tail probability of
+    ``~e^-60``), and within them the transformed density is exactly Logistic
+    (xi-free) and divergence-free -- but the map is *not* finite on all of ``R``
+    for every parameter.
 
     Subclasses provide the family's ``_logp`` / ``_logcdf`` / ``_logccdf`` and the
     survival-space ``_excess_from_y``; ``inputs`` are the RV's owner inputs, so
@@ -1073,10 +1082,29 @@ class _ExtGenParetoPIT(_GPDProbabilityIntegralTransform):
 
     @staticmethod
     def _excess_from_y(value, mu, sigma, xi, kappa):
-        # u = sigmoid(y); H = u**(1/kappa); GPD survival = 1 - H = -expm1(log u / kappa).
-        # log u = log sigmoid(y) = -softplus(-y), stable; m = -log(GPD survival).
-        log_u = -pt.softplus(-value)
-        return -pt.log(-pt.expm1(log_u / kappa))
+        # m = -log(S_F), the GPD-survival exponent, recovered from y = logit(F_ext).
+        #
+        # Bulk: S_F = 1 - F_ext**(1/kappa) with log F_ext = -softplus(-y). That log
+        # underflows to exactly 0 near y ~ 745 (softplus(-y) rounds to 0), sending
+        # S_F -> 0 and m -> inf while the quantile is still finite -- so the bulk
+        # form is used only where t = softplus(y) < 40 (no underflow there; since
+        # softplus(y) > y always, t < 40 implies value < 40, so the clamp below is
+        # a no-op on the selected region and merely keeps the *discarded* branch
+        # finite when value is large).
+        #
+        # Tail: in the far upper tail S_ext = exp(-softplus(y)) is tiny and
+        #   S_F = 1 - (1 - S_ext)**(1/kappa) ~ S_ext / kappa,  giving
+        #   m -> t + log(kappa) - log(_log1p_div(-exp(-t))),  t = softplus(y).
+        # This never forms exp(-y) before a log, so when exp(-t) underflows to 0 the
+        # C1 helper returns its limit 1 and m = t + log(kappa) stays finite until t
+        # itself overflows float64. The two forms agree to machine precision at
+        # t ~ 40 (the correction is O(exp(-t))), so the switch is C1 there.
+        t = pt.softplus(value)
+        log_F = -pt.softplus(-pt.minimum(value, 40.0))
+        m_bulk = -pt.log(-pt.expm1(log_F / kappa))
+        s = pt.exp(-pt.maximum(t, 40.0))  # >= 40 keeps _log1p_div finite off-branch
+        m_tail = t + pt.log(kappa) - pt.log(_log1p_div(-s))
+        return pt.switch(t < 40.0, m_bulk, m_tail)
 
     @staticmethod
     def _quantile_from_excess(excess, mu, sigma, xi, kappa):

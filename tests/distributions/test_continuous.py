@@ -715,12 +715,15 @@ class TestGenParetoTransforms:
         "dist_kwargs, builder, y_max",
         [
             # Exponential tail (xi = 0, unbounded, no overflow): exact very far out.
+            # The ExtGenPareto probe at y = 1000 reaches past y ~ 745, where the
+            # naive log-F recovery of the excess underflowed (S_F -> 0, m -> inf);
+            # recovering it from the survival side keeps it finite and exact.
             ({"mu": 0.0, "sigma": 1.0, "xi": 0.0}, GenPareto, 1000.0),
-            ({"mu": 0.0, "sigma": 1.0, "xi": 0.0, "kappa": 2.0}, ExtGenPareto, 700.0),
+            ({"mu": 0.0, "sigma": 1.0, "xi": 0.0, "kappa": 2.0}, ExtGenPareto, 1000.0),
             # Mild heavy tail: the quantile ~ exp(xi * m) overflows only at
-            # y ~ 709 / xi, so 400 is well inside.
+            # y ~ 709 / xi (~2363 here), so 1000 is well inside for both families.
             ({"mu": 0.0, "sigma": 1.0, "xi": 0.3}, GenPareto, 400.0),
-            ({"mu": 0.0, "sigma": 1.0, "xi": 0.3, "kappa": 2.0}, ExtGenPareto, 400.0),
+            ({"mu": 0.0, "sigma": 1.0, "xi": 0.3, "kappa": 2.0}, ExtGenPareto, 1000.0),
         ],
     )
     def test_transform_exact_deep_into_the_tail(self, dist_kwargs, builder, y_max):
