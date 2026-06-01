@@ -613,12 +613,15 @@ class TestGenParetoHeavyTail:
 
 
 class TestGenParetoTransforms:
-    """Both distributions register a default Interval transform.
+    """Both distributions register a default probability-integral transform.
 
-    Without it, an unobserved (latent) GPD variable would be sampled on all of
-    R, where every proposal below mu has -inf logp -- breaking NUTS. The
+    Without a transform, an unobserved (latent) GPD variable would be sampled on
+    all of R, where every proposal below mu has -inf logp -- breaking NUTS. The
     transform maps to the (parameter-dependent) support, so sampling stays valid
-    for both the heavy (xi >= 0) and bounded (xi < 0) regimes.
+    for both the heavy (xi >= 0) and bounded (xi < 0) regimes. A naive Interval
+    transform would do this too, but its log-Jacobian is discontinuous in xi at
+    0; the probability-integral transform (``y = logit(F(x))``) is C1 in every
+    parameter, so it does not inject a gradient kink when xi is random.
     """
 
     pytestmark = _GPD_FPE_FILTERS
@@ -629,6 +632,44 @@ class TestGenParetoTransforms:
             e = ExtGenPareto("e", mu=2.0, sigma=1.0, xi=-0.4, kappa=2.0)
         assert model.rvs_to_transforms[x] is not None
         assert model.rvs_to_transforms[e] is not None
+
+    @pytest.mark.parametrize(
+        "dist_kwargs, builder",
+        [
+            ({"mu": 0.0, "sigma": 1.5, "xi": -0.5}, GenPareto),
+            ({"mu": 0.0, "sigma": 1.5, "xi": 0.0}, GenPareto),
+            ({"mu": 0.0, "sigma": 1.5, "xi": 0.5}, GenPareto),
+            ({"mu": 0.0, "sigma": 1.0, "xi": -0.3, "kappa": 2.0}, ExtGenPareto),
+            ({"mu": 0.0, "sigma": 1.0, "xi": 0.3, "kappa": 2.0}, ExtGenPareto),
+        ],
+    )
+    def test_transformed_density_integrates_to_one(self, dist_kwargs, builder):
+        # The transform's log-Jacobian must be correct: exp(transformed logp)
+        # integrates to 1 over the unconstrained line.
+        from scipy.integrate import trapezoid
+
+        with pm.Model() as model:
+            builder("x", **dist_kwargs)
+        y = model.value_vars[0]
+        logp = pytensor.function([y], model.logp(sum=True))
+        ys = np.linspace(-30, 30, 30001)
+        density = np.exp(np.array([float(logp(yi)) for yi in ys]))
+        np.testing.assert_allclose(trapezoid(density, ys), 1.0, atol=1e-3)
+
+    def test_jacobian_gradient_is_continuous_through_xi_zero(self):
+        # The headline reason for the probability-integral transform: with xi a
+        # random variable, the transformed logp must be C1 in xi across 0. An
+        # Interval transform fails this (its Jacobian jumps by ~1e12 at xi = 0).
+        with pm.Model() as model:
+            xi = pm.Normal("xi", 0.0, 1.0)
+            GenPareto("x", mu=0.0, sigma=1.0, xi=xi)
+        val_xi = next(v for v in model.value_vars if v.name == "xi")
+        val_x = next(v for v in model.value_vars if v.name != "xi")
+        logp = model.logp(sum=True)
+        fn = pytensor.function([val_xi, val_x], pt.grad(logp, val_xi), on_unused_input="ignore")
+        grad_minus = float(fn(-1e-6, 0.5))
+        grad_plus = float(fn(1e-6, 0.5))
+        assert abs(grad_minus - grad_plus) < 1e-3
 
     @pytest.mark.parametrize(
         "xi, mu, sigma",
