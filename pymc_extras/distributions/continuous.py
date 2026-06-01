@@ -897,8 +897,10 @@ class ExtGenPareto(Continuous):
     Euler--Mascheroni :math:`\gamma`) and the variance to
     :math:`\sigma^2(\pi^2/6 - \psi'(\kappa + 1))`. The mode formulae above assume
     :math:`\xi > -1`; for :math:`\xi \leq -1` the supremum sits at the right
-    endpoint, as for :class:`GenPareto`. The ``support_point`` is the median
-    (finite for all :math:`\xi`).
+    endpoint, as for :class:`GenPareto`. The ``support_point`` is the ExtGPD
+    median when that is representable; for very small :math:`\kappa` the median
+    rounds onto :math:`\mu`, so it falls back to the underlying GPD median
+    (carrier :math:`H = 1/2`) to keep the initialization interior.
 
     Parameters
     ----------
@@ -990,9 +992,11 @@ class ExtGenPareto(Continuous):
         # transforms to a -inf initial point. A support point only has to be a usable
         # initialization, so when the median collapses to mu fall back to the
         # underlying GPD median (carrier H = 1/2, excess = log 2) -- a higher ExtGPD
-        # quantile (F = 0.5 ** kappa) that is representably interior, mu + O(sigma),
-        # for any kappa, hence has a finite transformed logp. At kappa = 1 the two
-        # coincide, so ordinary kappa is unchanged.
+        # quantile (F = 0.5 ** kappa) at mu + O(sigma), interior (hence a finite
+        # transformed logp) for any kappa at ordinary scales. It can still round
+        # back to mu in the general representability limit where the support has no
+        # distinct interior point (sigma far below ulp(mu), or a sub-ULP bounded
+        # support). At kappa = 1 the two coincide, so ordinary kappa is unchanged.
         excess = _ext_gpd_excess_from_log_prob(np.log(0.5), kappa)
         median = _gpd_quantile_from_excess(excess, mu, sigma, xi)
         gpd_median = _gpd_quantile_from_excess(np.log(2.0), mu, sigma, xi)
@@ -1057,11 +1061,15 @@ class _GPDProbabilityIntegralTransform(Transform):
     kappa)`` -- well past where a sampler goes for ordinary shape values. For
     ``kappa`` smaller than that the carrier underflows and the excess rounds
     toward ``0`` (``x -> mu``, still *in support*, transformed logp ``-> -inf``);
-    it never leaves the support. The *initial* point is unaffected by this floor:
-    ``ExtGenPareto.support_point`` falls back to a higher quantile when the median
-    rounds onto ``mu``, so the default transform yields a finite starting logp for
-    every ``kappa > 0`` (the ``forward`` map is built from ``logcdf - logccdf`` in
-    log space, so it stays finite even where ``F`` itself rounds to ``1``).
+    it never leaves the support. The *initial* point is largely unaffected by this
+    floor: ``ExtGenPareto.support_point`` falls back to the underlying GPD median
+    when the ExtGPD median rounds onto ``mu``, and because ``forward`` is built
+    from ``logcdf - logccdf`` in log space (never ``logit(F)`` with ``F`` rounded
+    to ``1``) the starting logp stays finite for essentially any ``kappa > 0``. The
+    sole exception is the general representability limit where the support has no
+    distinct interior point to begin with -- ``sigma`` far below ``ulp(mu)``, or a
+    bounded ``xi < 0`` whose whole width is sub-ULP -- where even the fallback
+    rounds back to ``mu`` and the initial logp is ``-inf``.
 
     Subclasses provide the family's ``_logp`` / ``_logcdf`` / ``_logccdf`` and the
     survival-space ``_excess_from_y``; ``inputs`` are the RV's owner inputs, so
