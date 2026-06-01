@@ -760,6 +760,60 @@ class TestGenParetoTransforms:
         # Past the float64 ceiling the quantile is +inf, so the logp is not finite.
         assert not np.isfinite(float(transformed_logp(boundary * 1.5)))
 
+    @pytest.mark.parametrize(
+        "kappa, ys",
+        [
+            (1e8, (-30.0, 0.0, 30.0)),
+            (1e4, (-30.0, 0.0, 30.0)),
+            (1.0, (-40.0, 0.0, 40.0)),
+            (0.1, (-30.0, 0.0, 40.0)),
+            # Upper tail with kappa < 1 is exactly where a y-only tail switch
+            # returned a negative excess (x < mu); here it is exact.
+            (1e-2, (-5.0, 0.0, 40.0)),
+        ],
+    )
+    def test_extgenpareto_transform_is_exact_across_kappa(self, kappa, ys):
+        # The ExtGPD inverse must depend on kappa, not just on y: the excess is
+        # recovered via -log1mexp(log F_ext / kappa), whose log1p branch keeps a
+        # tiny GPD survival from collapsing the excess to 0 (a -log(-expm1(.)) form
+        # would). The map is exactly Logistic across ten orders of magnitude in
+        # kappa at ordinary tail depths. Probe depths are kept inside each kappa's
+        # exact domain (small kappa has essentially no representable *lower* tail --
+        # the carrier H = F_ext ** (1/kappa) underflows once |y| / kappa >~ 745 --
+        # which is the distribution concentrating toward mu, not a defect).
+        with pm.Model() as model:
+            ExtGenPareto("x", mu=0.0, sigma=1.0, xi=0.0, kappa=kappa)
+        yv = model.value_vars[0]
+        transformed_logp = pytensor.function([yv], model.logp(sum=True))
+        tr = model.rvs_to_transforms[model.free_RVs[0]]
+        inputs = model.free_RVs[0].owner.inputs
+        roundtrip = pytensor.function([yv], tr.forward(tr.backward(yv, *inputs), *inputs))
+        for y in ys:
+            lp = float(transformed_logp(y))
+            logistic = -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y)
+            assert np.isfinite(lp)
+            np.testing.assert_allclose(lp, logistic, atol=1e-6)
+            np.testing.assert_allclose(float(roundtrip(y)), y, atol=1e-6)
+
+    @pytest.mark.parametrize("kappa", [1e-20, 1e-100, 1e-300])
+    def test_extgenpareto_transform_stays_in_support_for_tiny_kappa(self, kappa):
+        # Below the exact-kappa domain the carrier underflows, but the recovered
+        # quantile must stay >= mu (in support) and finite -- never the negative
+        # excess (x < mu, logp = -inf) that a y-only tail switch produced. The
+        # transformed logp may degrade to -inf there (x rounds to the lower
+        # endpoint), but it is never NaN and the point never leaves the support.
+        with pm.Model() as model:
+            ExtGenPareto("x", mu=2.0, sigma=1.0, xi=0.0, kappa=kappa)
+        rv = model.free_RVs[0]
+        yv = model.value_vars[0]
+        tr = model.rvs_to_transforms[rv]
+        backward = pytensor.function([yv], tr.backward(yv, *rv.owner.inputs))
+        logp = pytensor.function([yv], model.logp(sum=True))
+        for y in (-30.0, 0.0, 30.0, 80.0):
+            x = float(backward(y))
+            assert np.isfinite(x) and x >= 2.0  # in support [mu, inf)
+            assert not np.isnan(float(logp(y)))
+
     def test_jacobian_gradient_is_continuous_through_xi_zero(self):
         # The headline reason for the probability-integral transform: with xi a
         # random variable, the transformed logp must be C1 in xi across 0. An
