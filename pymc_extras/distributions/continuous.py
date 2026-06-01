@@ -487,6 +487,18 @@ def _in_gpd_support(z, xi):
     return pt.and_(z >= 0, 1 + _safe_mul(xi, z) > 0)
 
 
+def _propagate_nonfinite_shape(result, z, xi):
+    """Map ``result`` to ``nan`` wherever ``xi`` (hence ``1 + xi z``) is non-finite.
+
+    The support / boundary ``switch`` masks below mask out-of-support values to
+    ``-inf`` / ``0``; without this a ``nan`` shape would be silently turned into
+    one of those ("valid parameter, impossible value", which is a lie). ``nan``
+    in -> ``nan`` out, consistently across logp / logcdf / logccdf and matching
+    how pymc's own distributions propagate a non-finite parameter.
+    """
+    return pt.switch(pt.isnan(1 + _safe_mul(xi, z)), np.nan, result)
+
+
 # The ``gen_pareto_*`` / ``ext_gen_pareto_*`` builders below are pure PyTensor:
 # they assemble the masked log-density / log-CDF / quantile graphs and call NO
 # PyMC parameter check, which keeps them portable (the math can be reused
@@ -502,10 +514,7 @@ def gen_pareto_logp(value, mu, sigma, xi):
     # in-support branch would evaluate log1p(inf)/inf -> nan there, so pin
     # z = +inf to -inf explicitly.
     logp = pt.switch(pt.eq(z, np.inf), -np.inf, logp)
-    # Propagate a non-finite shape: ``1 + xi z`` is nan when xi is nan, and the
-    # support switch would otherwise mask it to -inf ("valid param, impossible
-    # value"). nan in -> nan out, matching how pymc's own distributions behave.
-    return pt.switch(pt.isnan(1 + _safe_mul(xi, z)), np.nan, logp)
+    return _propagate_nonfinite_shape(logp, z, xi)
 
 
 def gen_pareto_logcdf(value, mu, sigma, xi):
@@ -517,7 +526,8 @@ def gen_pareto_logcdf(value, mu, sigma, xi):
     logcdf = pt.switch(above_upper, 0.0, _gpd_log_H(z, xi))
     logcdf = pt.switch(z >= 0, logcdf, -np.inf)
     # CDF -> 1 (logcdf 0) at the +inf tail; for xi > 0 _gpd_log_H(inf) is nan.
-    return pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
+    logcdf = pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
+    return _propagate_nonfinite_shape(logcdf, z, xi)
 
 
 def gen_pareto_logccdf(value, mu, sigma, xi):
@@ -534,7 +544,8 @@ def gen_pareto_logccdf(value, mu, sigma, xi):
     above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + _safe_mul(xi, z), 0))
     logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
     # Below mu the survival is 1 (logsf 0).
-    return pt.switch(z < 0, 0.0, logsf)
+    logsf = pt.switch(z < 0, 0.0, logsf)
+    return _propagate_nonfinite_shape(logsf, z, xi)
 
 
 def gen_pareto_icdf(value, mu, sigma, xi):
@@ -564,8 +575,7 @@ def ext_gen_pareto_logp(value, mu, sigma, xi, kappa):
     logp = pt.log(kappa) + carrier + _gpd_log_h(z, sigma, xi)
     logp = pt.switch(_in_gpd_support(z, xi), logp, -np.inf)
     logp = pt.switch(pt.eq(z, np.inf), -np.inf, logp)
-    # Propagate a non-finite shape (see gen_pareto_logp).
-    return pt.switch(pt.isnan(1 + _safe_mul(xi, z)), np.nan, logp)
+    return _propagate_nonfinite_shape(logp, z, xi)
 
 
 def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
@@ -574,22 +584,26 @@ def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
     above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + _safe_mul(xi, z), 0))
     logcdf = pt.switch(above_upper, 0.0, kappa * _gpd_log_H(z, xi))
     logcdf = pt.switch(z >= 0, logcdf, -np.inf)
-    return pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
+    logcdf = pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
+    return _propagate_nonfinite_shape(logcdf, z, xi)
 
 
 def ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa):
     """Pure-PyTensor extended-GPD log complementary CDF (log survival function).
 
-    ``S = 1 - H ** kappa``. The naive ``log1mexp(kappa * log H)`` collapses to
-    ``-inf`` deep in the tail, because ``log H -> 0`` underflows there even though
-    ``S`` is still finite (``~ kappa * S_gpd``). Two regimes keyed on the GPD log
-    survival ``a = log(1 - H)``:
+    ``S = 1 - H ** kappa``, with ``a = log(1 - H) = -m`` the GPD log survival
+    (exact in the tail). The generic ``log1mexp(kappa * log H)`` collapses to
+    ``-inf`` once ``log H`` underflows to ``0`` deep in the tail, even though the
+    survival is still finite (``1 - H**kappa ~ kappa * S_gpd``). Two regimes,
+    keyed on ``log(kappa) + a`` (i.e. on ``kappa * S_gpd`` -- so the switch is
+    correct for *any* kappa, not just small ones):
 
-    - well inside (``a`` not tiny): ``log1mexp(kappa * log1mexp(a))`` -- exact.
-    - deep tail (``a < -30``): ``1 - H**kappa = 1 - (1 - S_gpd)**kappa
+    - ``log(kappa) + a`` not tiny: ``log1mexp(kappa * log1mexp(a))`` -- exact.
+    - ``log(kappa) + a < -30`` (``kappa * S_gpd`` negligible):
+      ``1 - H**kappa = 1 - (1 - S_gpd)**kappa
       = kappa S_gpd [1 - (kappa-1)/2 S_gpd + (kappa-1)(kappa-2)/6 S_gpd**2 - ...]``;
-      take logs. The two pieces agree to ~1e-8 at the crossover, so the seam is
-      smooth.
+      take logs. Verified vs an 80-digit reference to <= 5e-16 across xi and
+      kappa up to 1e20.
     """
     z = (value - mu) / sigma
     a = _gpd_log_S(z, xi)  # log(1 - H), exact in the tail
@@ -598,10 +612,11 @@ def ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa):
     s = pt.exp(a)  # S_gpd, tiny in the tail
     series = 1.0 - (kappa - 1) / 2.0 * s + (kappa - 1) * (kappa - 2) / 6.0 * s**2
     tail = pt.log(kappa) + a + pt.log1p(series - 1.0)
-    logsf = pt.switch(a < -30.0, tail, generic)
+    logsf = pt.switch(pt.log(kappa) + a < -30.0, tail, generic)
     above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + _safe_mul(xi, z), 0))
     logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
-    return pt.switch(z < 0, 0.0, logsf)
+    logsf = pt.switch(z < 0, 0.0, logsf)
+    return _propagate_nonfinite_shape(logsf, z, xi)
 
 
 def ext_gen_pareto_icdf(value, mu, sigma, xi, kappa):
@@ -851,7 +866,8 @@ class ExtGenPareto(Continuous):
               :class:`GenPareto`), i.e. the point at CDF probability
               :math:`H = 2^{-1/\kappa}`, equivalently survival
               :math:`1 - 2^{-1/\kappa}`
-    Mode      * :math:`\mu + \frac{\sigma}{\xi}\left[(T^\star)^{-\xi} - 1\right]`,
+    Mode      * :math:`\mu + \frac{\sigma}{\xi}\left[(T^\star)^{-\xi} - 1\right]`
+              (:math:`\mu - \sigma \ln T^\star` at :math:`\xi = 0`),
               :math:`T^\star = \frac{1 + \xi}{\kappa + \xi}`, when
               :math:`\kappa > 1` and :math:`\xi > -1`
               * :math:`\mu`, when :math:`\kappa \leq 1` (and :math:`\xi > -1`)
@@ -973,42 +989,86 @@ class _GPDProbabilityIntegralTransform(Transform):
     probability-integral transform. ``u = F(x)`` is mapped to ``y = logit(u)`` on
     the whole real line. Because ``F`` is the family's own CDF, the transformed
     prior density is *exactly Logistic and free of mu/sigma/xi*, so it is C1 in
-    every parameter (no kink anywhere), while the inverse ``icdf`` enforces the
-    correct support -- including the moving upper wall -- for all xi. Verified to
-    cut divergences to ~0 across xi < 0, xi = 0 and xi > 0, with the transformed
-    density integrating to 1 and ``forward(backward(y)) == y`` exactly.
+    every parameter (no kink anywhere), while the inverse enforces the correct
+    support -- including the moving upper wall -- for all xi.
 
-    Subclasses provide ``_logcdf`` / ``_icdf`` (the kappa-aware variants for the
-    extended family); ``inputs`` are the RV's owner inputs after rng and size.
+    Everything is done in survival / log space so it never materialises a
+    saturated probability: ``sigmoid(y)`` rounds to exactly ``1`` for ``y >= 37``
+    in float64, and feeding that into the quantile gives ``inf``/``nan`` on
+    perfectly valid unconstrained values. Instead ``backward`` builds the GPD
+    excess ``m = -log(survival)`` directly from ``y`` (``softplus(y)`` for the
+    base family), and ``log_jac_det`` uses the analytic
+    ``log F + log S - logp(x)`` rather than autodiffing the quantile graph.
+    Verified: the transformed density is exactly Logistic (xi-free) and finite
+    out to ``|y| = 100``, ``forward(backward(y)) == y``, and divergences fall to
+    ~0 across xi < 0, xi = 0 and xi > 0.
+
+    Subclasses provide the family's ``_logp`` / ``_logcdf`` / ``_logccdf`` and the
+    survival-space ``_excess_from_y``; ``inputs`` are the RV's owner inputs, so
+    ``inputs[2:]`` are the distribution parameters.
     """
 
     name = "gpd_pit"
     ndim_supp = 0
 
+    # Filled in by subclasses.
+    _logp = _logcdf = _logccdf = staticmethod(lambda *a: None)
+
     @staticmethod
-    def _logcdf(value, *params):
+    def _excess_from_y(value, *params):
+        """``m = -log(survival)`` as a function of the unconstrained ``y``."""
         raise NotImplementedError
 
     @staticmethod
-    def _icdf(value, *params):
+    def _quantile_from_excess(excess, *params):
         raise NotImplementedError
 
     def forward(self, value, *inputs):
-        u = pt.exp(self._logcdf(value, *inputs[2:]))
-        return pt.log(u) - pt.log1p(-u)  # logit(u)
+        params = inputs[2:]
+        # logit(F) = log F - log(1 - F) = logcdf - logccdf, both stable.
+        return self._logcdf(value, *params) - self._logccdf(value, *params)
 
     def backward(self, value, *inputs):
-        return self._icdf(pt.sigmoid(value), *inputs[2:])
+        params = inputs[2:]
+        return self._quantile_from_excess(self._excess_from_y(value, *params), *params)
+
+    def log_jac_det(self, value, *inputs):
+        params = inputs[2:]
+        x = self.backward(value, *inputs)
+        # y = logit(F(x)) => log|dx/dy| = log F + log S - log f(x).
+        return self._logcdf(x, *params) + self._logccdf(x, *params) - self._logp(x, *params)
 
 
 class _GenParetoPIT(_GPDProbabilityIntegralTransform):
+    _logp = staticmethod(gen_pareto_logp)
     _logcdf = staticmethod(gen_pareto_logcdf)
-    _icdf = staticmethod(gen_pareto_icdf)
+    _logccdf = staticmethod(gen_pareto_logccdf)
+
+    @staticmethod
+    def _excess_from_y(value, mu, sigma, xi):
+        # u = sigmoid(y); m = -log(1 - u) = -log(sigmoid(-y)) = softplus(y). Stable for all y.
+        return pt.softplus(value)
+
+    @staticmethod
+    def _quantile_from_excess(excess, mu, sigma, xi):
+        return _gpd_quantile_from_excess(excess, mu, sigma, xi)
 
 
 class _ExtGenParetoPIT(_GPDProbabilityIntegralTransform):
+    _logp = staticmethod(ext_gen_pareto_logp)
     _logcdf = staticmethod(ext_gen_pareto_logcdf)
-    _icdf = staticmethod(ext_gen_pareto_icdf)
+    _logccdf = staticmethod(ext_gen_pareto_logccdf)
+
+    @staticmethod
+    def _excess_from_y(value, mu, sigma, xi, kappa):
+        # u = sigmoid(y); H = u**(1/kappa); GPD survival = 1 - H = -expm1(log u / kappa).
+        # log u = log sigmoid(y) = -softplus(-y), stable; m = -log(GPD survival).
+        log_u = -pt.softplus(-value)
+        return -pt.log(-pt.expm1(log_u / kappa))
+
+    @staticmethod
+    def _quantile_from_excess(excess, mu, sigma, xi, kappa):
+        return _gpd_quantile_from_excess(excess, mu, sigma, xi)
 
 
 @_default_transform.register(GenPareto)

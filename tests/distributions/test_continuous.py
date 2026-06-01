@@ -611,6 +611,19 @@ class TestGenParetoHeavyTail:
             assert np.all(np.isfinite(got))
             np.testing.assert_allclose(got, np.log(kappa) - x, rtol=1e-9)
 
+    @pytest.mark.parametrize("kappa", [10.0, 1e6, 1e20])
+    def test_ext_logccdf_is_a_valid_log_probability_for_large_kappa(self, kappa):
+        # A log survival probability is always <= 0. The tail branch must key on
+        # kappa * S (not just the GPD survival), or large kappa makes
+        # log(kappa) + (-x) positive. xi = 0 -> survival = 1 - (1 - e^-x)^kappa;
+        # the exact tail value is log(kappa) - x when kappa * e^-x << 1.
+        x = np.array([40.0, 100.0, 1000.0])
+        got = pm.logccdf(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.0, kappa=kappa), x).eval()
+        assert np.all(got <= 0.0)
+        # where kappa * e^-x is negligible, log survival == log(kappa) - x
+        small = np.log(kappa) - x < -30.0
+        np.testing.assert_allclose(got[small], (np.log(kappa) - x)[small], rtol=1e-9)
+
 
 class TestGenParetoTransforms:
     """Both distributions register a default probability-integral transform.
@@ -655,6 +668,66 @@ class TestGenParetoTransforms:
         ys = np.linspace(-30, 30, 30001)
         density = np.exp(np.array([float(logp(yi)) for yi in ys]))
         np.testing.assert_allclose(trapezoid(density, ys), 1.0, atol=1e-3)
+
+    @pytest.mark.parametrize(
+        "dist_kwargs, builder",
+        [
+            ({"mu": 0.0, "sigma": 1.0, "xi": 0.3}, GenPareto),
+            ({"mu": 0.0, "sigma": 1.0, "xi": -0.5}, GenPareto),
+            ({"mu": 0.0, "sigma": 1.0, "xi": 0.3, "kappa": 2.0}, ExtGenPareto),
+            ({"mu": 0.0, "sigma": 1.0, "xi": -0.3, "kappa": 0.5}, ExtGenPareto),
+        ],
+    )
+    def test_transform_is_finite_and_logistic_in_the_tails(self, dist_kwargs, builder):
+        # Regression for the saturation bug: sigmoid(y) rounds to exactly 1 for
+        # y >= 37, so a naive backward via icdf(sigmoid(y)) returned inf/nan on
+        # perfectly valid unconstrained values around y = 37. Working in survival
+        # space (m = softplus(y)) keeps the transform finite far past that, equal
+        # to the Logistic log-density (the PIT image of the GPD prior), with
+        # forward(backward(y)) round-tripping. The probed range stays inside what
+        # float64 can represent for *every* parametrization (the bounded xi < 0
+        # case saturates at its wall only beyond |y| ~ 70 -- see
+        # ``test_unbounded_transform_is_finite_arbitrarily_far`` for the xi >= 0
+        # case, which has no wall and stays finite to |y| ~ 1000). For the
+        # bounded xi < 0 case the round-trip CDF (``log1mexp`` near the wall)
+        # loses accuracy beyond |y| ~ 48, so the probe stays at |y| <= 45 -- well
+        # past the y = 37 saturation bug this guards.
+        with pm.Model() as model:
+            x = builder("x", **dist_kwargs)
+        yv = model.value_vars[0]
+        transformed_logp = pytensor.function([yv], model.logp(sum=True))
+        tr = model.rvs_to_transforms[x]
+        inputs = x.owner.inputs
+        roundtrip = pytensor.function([yv], tr.forward(tr.backward(yv, *inputs), *inputs))
+
+        for y in (-45.0, -40.0, -37.0, 37.0, 40.0, 45.0):
+            lp = float(transformed_logp(y))
+            logistic = -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y)
+            assert np.isfinite(lp)
+            np.testing.assert_allclose(lp, logistic, atol=1e-6)
+            np.testing.assert_allclose(float(roundtrip(y)), y, atol=1e-6)
+
+    @pytest.mark.parametrize(
+        "dist_kwargs, builder",
+        [
+            ({"mu": 0.0, "sigma": 1.0, "xi": 0.3}, GenPareto),
+            ({"mu": 0.0, "sigma": 1.0, "xi": 0.0}, GenPareto),
+            ({"mu": 0.0, "sigma": 1.0, "xi": 0.3, "kappa": 2.0}, ExtGenPareto),
+        ],
+    )
+    def test_unbounded_transform_is_finite_arbitrarily_far(self, dist_kwargs, builder):
+        # For xi >= 0 there is no upper wall, so the transform must stay finite
+        # and Logistic at arbitrarily large |y| (a quantile only overflows to inf
+        # near the float64 ceiling, far past any sampler's reach).
+        with pm.Model() as model:
+            builder("x", **dist_kwargs)
+        yv = model.value_vars[0]
+        transformed_logp = pytensor.function([yv], model.logp(sum=True))
+        for y in (100.0, 200.0, 400.0):
+            lp = float(transformed_logp(y))
+            logistic = -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y)
+            assert np.isfinite(lp)
+            np.testing.assert_allclose(lp, logistic, atol=1e-6)
 
     def test_jacobian_gradient_is_continuous_through_xi_zero(self):
         # The headline reason for the probability-integral transform: with xi a
