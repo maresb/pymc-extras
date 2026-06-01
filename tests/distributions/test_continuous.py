@@ -31,8 +31,10 @@ from pymc.testing import (
     Rplusbig,
     assert_support_point_is_expected,
     check_icdf,
+    check_logccdf,
     check_logcdf,
     check_logp,
+    check_selfconsistency_icdf,
     seeded_scipy_distribution_builder,
     select_by_precision,
 )
@@ -247,6 +249,18 @@ def ref_ext_logcdf(value, mu, sigma, xi, kappa):
     return kappa * sp.genpareto.logcdf(z, c=xi)
 
 
+def ref_ext_logccdf(value, mu, sigma, xi, kappa):
+    # S = 1 - H ** kappa, with H the GPD CDF. Compute via the GPD log-CDF so the
+    # reference stays accurate deep in the tail (where H -> 1 and the naive
+    # 1 - H**kappa underflows to 0) -- exactly the regime logccdf is for.
+    z = (value - mu) / sigma
+    if z < 0:
+        return 0.0
+    if xi < 0 and (1 + xi * z) <= 0:
+        return -np.inf
+    return np.log(-np.expm1(kappa * sp.genpareto.logcdf(z, c=xi)))
+
+
 def ref_ext_icdf(q, mu, sigma, xi, kappa):
     # G^{-1}(q) = H^{-1}(q ** (1/kappa)).
     return sp.genpareto.ppf(q ** (1 / kappa), c=xi, loc=mu, scale=sigma)
@@ -278,6 +292,17 @@ class TestGenParetoClass:
             decimal=select_by_precision(float64=6, float32=3),
         )
 
+    def test_logccdf(self):
+        # log survival function: exact and tail-stable (vs the lossy
+        # log1mexp(logcdf) fallback). Compared against scipy genpareto.logsf.
+        check_logccdf(
+            GenPareto,
+            Rplusbig,
+            {"mu": Domain([0], edges=(None, None)), "sigma": Rplusbig, "xi": XI_DOMAIN},
+            lambda value, mu, sigma, xi: sp.genpareto.logsf(value, c=xi, loc=mu, scale=sigma),
+            decimal=select_by_precision(float64=6, float32=3),
+        )
+
     def test_icdf(self):
         check_icdf(
             GenPareto,
@@ -285,6 +310,24 @@ class TestGenParetoClass:
             lambda q, mu, sigma, xi: sp.genpareto.ppf(q, c=xi, loc=mu, scale=sigma),
             decimal=select_by_precision(float64=5, float32=3),
         )
+
+    def test_icdf_selfconsistency(self):
+        # cdf(icdf(q)) == q, no scipy reference needed.
+        check_selfconsistency_icdf(
+            GenPareto,
+            {"mu": Domain([0], edges=(None, None)), "sigma": SIGMA_ICDF, "xi": XI_DOMAIN},
+            decimal=select_by_precision(float64=5, float32=3),
+        )
+
+    def test_logccdf_tail_is_stable(self):
+        # Far in the heavy upper tail logcdf -> 0, so the generic
+        # log1mexp(logcdf) survival fallback collapses; the direct logccdf stays
+        # exact. Check it matches scipy out to x = 1e8.
+        x = np.array([1e2, 1e4, 1e6, 1e8])
+        for xi in (0.1, 0.3, 0.7):
+            got = pm.logccdf(GenPareto.dist(mu=0.0, sigma=1.0, xi=xi), x).eval()
+            ref = sp.genpareto.logsf(x, c=xi)
+            np.testing.assert_allclose(got, ref, rtol=1e-12)
 
     @pytest.mark.parametrize(
         "mu, sigma, xi, size, expected",
@@ -351,6 +394,20 @@ class TestExtGenParetoClass:
             decimal=select_by_precision(float64=6, float32=3),
         )
 
+    def test_logccdf(self):
+        check_logccdf(
+            ExtGenPareto,
+            Rplus,
+            {
+                "mu": Domain([0], edges=(None, None)),
+                "sigma": Rplusbig,
+                "xi": XI_DOMAIN,
+                "kappa": KAPPA_DOMAIN,
+            },
+            ref_ext_logccdf,
+            decimal=select_by_precision(float64=6, float32=3),
+        )
+
     def test_icdf(self):
         check_icdf(
             ExtGenPareto,
@@ -363,6 +420,25 @@ class TestExtGenParetoClass:
             ref_ext_icdf,
             decimal=select_by_precision(float64=5, float32=3),
         )
+
+    def test_icdf_selfconsistency(self):
+        check_selfconsistency_icdf(
+            ExtGenPareto,
+            {
+                "mu": Domain([0], edges=(None, None)),
+                "sigma": SIGMA_ICDF,
+                "xi": XI_DOMAIN,
+                "kappa": KAPPA_DOMAIN,
+            },
+            decimal=select_by_precision(float64=5, float32=3),
+        )
+
+    def test_logccdf_reduces_to_gpd_at_kappa_one(self):
+        value = np.linspace(0.05, 8.0, 40)
+        for xi in (-0.3, 0.0, 0.4):
+            ext = pm.logccdf(ExtGenPareto.dist(mu=0.0, sigma=1.5, xi=xi, kappa=1.0), value).eval()
+            gpd = pm.logccdf(GenPareto.dist(mu=0.0, sigma=1.5, xi=xi), value).eval()
+            np.testing.assert_allclose(ext, gpd, rtol=1e-12, atol=1e-12)
 
     def test_kappa_one_equals_gpd(self):
         # kappa = 1 collapses the carrier G(v) = v ** kappa to the identity.
