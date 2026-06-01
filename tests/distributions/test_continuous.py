@@ -11,6 +11,8 @@
 #   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
+from decimal import Decimal, getcontext
+
 import numpy as np
 import pymc as pm
 import pytensor
@@ -43,6 +45,7 @@ from scipy import stats
 
 # the distributions to be tested
 from pymc_extras.distributions import Chi, ExtGenPareto, GenExtreme, GenPareto, Maxwell
+from pymc_extras.distributions.continuous import ext_gen_pareto_logp, gen_pareto_logp
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:Numba will use object mode to run Generalized Extreme Value:UserWarning"
@@ -265,6 +268,37 @@ def ref_ext_logccdf(value, mu, sigma, xi, kappa):
 def ref_ext_icdf(q, mu, sigma, xi, kappa):
     # G^{-1}(q) = H^{-1}(q ** (1/kappa)).
     return sp.genpareto.ppf(q ** (1 / kappa), c=xi, loc=mu, scale=sigma)
+
+
+def _gpd_ref_logp(value, mu, sigma, xi, kappa=None):
+    """100-digit (Ext)GPD logp from the *exact* margin s = 1 + xi*z.
+
+    ``mu/sigma/xi/kappa`` are ``Decimal``; ``value`` is the float64 input. Building
+    ``s`` at 100 digits avoids the ``1 + xi*z -> 0`` cancellation that the float64
+    path cannot, so this is the truth the float64 logp/gradient is measured against.
+    """
+    getcontext().prec = 100
+    z = (Decimal(value) - mu) / sigma
+    log_s = (1 + xi * z).ln()
+    logp = -sigma.ln() - (1 + 1 / xi) * log_s  # = -log sigma - (1 + 1/xi) log s
+    if kappa is not None:
+        # carrier: (kappa - 1) log H, H = 1 - exp(-m) = 1 - s ** (-1/xi)
+        log_H = (1 - ((Decimal(-1) / xi) * log_s).exp()).ln()
+        logp += kappa.ln() + (kappa - 1) * log_H
+    return logp
+
+
+def _gpd_ref_grad(value, params, which):
+    """High-precision central difference d logp / d ``which`` (params: Decimals).
+
+    The reference function has ~1/s**k derivatives at the wall, so the step is tiny
+    (1e-22 relative) and the arithmetic is 100-digit -- the finite-difference error
+    stays far below the float64 gradient error being measured.
+    """
+    h = abs(params[which]) * Decimal("1e-22") or Decimal("1e-22")
+    hi = dict(params, **{which: params[which] + h})
+    lo = dict(params, **{which: params[which] - h})
+    return (_gpd_ref_logp(value, **hi) - _gpd_ref_logp(value, **lo)) / (2 * h)
 
 
 class TestGenParetoClass:
@@ -687,6 +721,89 @@ class TestGenParetoHeavyTail:
         # where kappa * e^-x is negligible, log survival == log(kappa) - x
         small = np.log(kappa) - x < -30.0
         np.testing.assert_allclose(got[small], (np.log(kappa) - x)[small], rtol=1e-9)
+
+
+class TestGenParetoBoundaryPrecision:
+    """Precision of logp / gradient as ``value`` approaches the ``xi < 0`` wall.
+
+    The family enters only through ``s = 1 + xi*z``; as ``value -> mu - sigma/xi``
+    the float64 input loses the low bits of ``s`` (it cancels toward 0). The
+    log-density *value* survives -- it is ``~|1 + 1/xi| * log s``, large magnitude,
+    so the relative error stays near machine precision -- but gradient terms that
+    scale like ``z/s`` inherit ``s``'s lost digits and are accurate only to
+    ``~ulp/s``. The kappa gradient is exempt (its carrier term has no ``1/s``
+    factor). These tests pin that behaviour against a 100-digit decimal reference
+    built from the exact margin, so the limit is documented and regression-guarded.
+    The fix that *recovers* the gradient is a margin-aware entry point (the caller
+    supplies ``s`` without cancellation); see the class docstring note.
+    """
+
+    pytestmark = _GPD_FPE_FILTERS
+
+    @pytest.mark.parametrize("xi", [-0.05, -0.3, -0.7])
+    def test_boundary_logp_and_gradient_track_the_margin(self, xi):
+        mu, sigma, kappa = 0.4, 1.3, 2.5
+        eps = np.finfo(np.float64).eps
+        margins = [1e-2, 1e-4, 1e-6, 1e-9, 1e-12]
+
+        v, sig, xs, ks = (pt.dscalar(n) for n in ("v", "sig", "xs", "ks"))
+        gpd_lp = gen_pareto_logp(v, mu, sig, xs)
+        gpd_fn = pytensor.function(
+            [v, sig, xs], [gpd_lp, pt.grad(gpd_lp, sig), pt.grad(gpd_lp, xs)]
+        )
+        ext_lp = ext_gen_pareto_logp(v, mu, sig, xs, ks)
+        ext_fn = pytensor.function(
+            [v, sig, xs, ks],
+            [ext_lp, pt.grad(ext_lp, sig), pt.grad(ext_lp, xs), pt.grad(ext_lp, ks)],
+        )
+
+        cases = [
+            ("GPD", gpd_fn, (), ["sigma", "xi"], None),
+            ("ExtGPD", ext_fn, (kappa,), ["sigma", "xi", "kappa"], kappa),
+        ]
+        for label, fn, extra, names, kap in cases:
+            params = {"mu": Decimal(mu), "sigma": Decimal(sigma), "xi": Decimal(xi)}
+            if kap is not None:
+                params["kappa"] = Decimal(kappa)
+
+            prev_logp = np.inf  # margins go large s -> small s, so logp must decrease
+            for s_target in margins:
+                value = mu + sigma * ((s_target - 1) / xi)  # float64 input at margin s
+                logp_f, *grads_f = (float(o) for o in fn(value, sigma, xi, *extra))
+                logp_ref = _gpd_ref_logp(value, **params)
+
+                assert np.isfinite(logp_f), (label, s_target)
+                assert all(np.isfinite(g) for g in grads_f), (label, s_target)
+                # density -> 0 at the wall for -1 < xi < 0, so logp is monotone in s
+                assert logp_f < prev_logp, (label, s_target)
+                prev_logp = logp_f
+                # the *value* keeps near-machine relative accuracy at every margin
+                assert abs((Decimal(logp_f) - logp_ref) / logp_ref) < 1e-4, (label, s_target)
+
+                grad_bound = 100 * eps / s_target  # the achievable ~ulp/s limit
+                for name, g in zip(names, grads_f):
+                    g_ref = _gpd_ref_grad(value, params, name)
+                    rel = abs((Decimal(g) - g_ref) / g_ref)
+                    assert np.sign(g) == np.sign(float(g_ref)), (label, name, s_target)
+                    if name == "kappa":
+                        # no 1/s term -> stays exact even at the wall
+                        assert rel < 1e-10, (label, name, s_target, float(rel))
+                    else:
+                        assert rel < grad_bound, (label, name, s_target, float(rel))
+
+    def test_far_from_boundary_gradient_is_machine_accurate(self):
+        # Contrast: away from the wall (s ~ 1) the gradient is exact to ~machine
+        # precision -- the degradation above is margin-driven, not a generic defect.
+        mu, sigma, xi = 0.4, 1.3, -0.3
+        value = mu + sigma * ((0.5 - 1) / xi)  # s = 0.5, mid-support
+        params = {"mu": Decimal(mu), "sigma": Decimal(sigma), "xi": Decimal(xi)}
+        v, sig, xs = (pt.dscalar(n) for n in ("v", "sig", "xs"))
+        lp = gen_pareto_logp(v, mu, sig, xs)
+        fn = pytensor.function([v, sig, xs], [pt.grad(lp, sig), pt.grad(lp, xs)])
+        g_sig, g_xi = (float(o) for o in fn(value, sigma, xi))
+        for name, g in [("sigma", g_sig), ("xi", g_xi)]:
+            g_ref = _gpd_ref_grad(value, params, name)
+            assert abs((Decimal(g) - g_ref) / g_ref) < 1e-12
 
 
 class TestGenParetoTransforms:

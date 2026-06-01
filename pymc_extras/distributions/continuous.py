@@ -446,25 +446,41 @@ def _safe_mul(a, b):
     return pt.switch(zero_times_inf, 0.0, prod)
 
 
-def _gpd_log_h(z, sigma, xi):
-    """GPD log-density, in-support expression (no support masking)."""
+def _gpd_tail(z, xi):
+    """``(t, log_s)`` for ``t = xi * z`` and ``log_s = log(1 + xi * z)``.
+
+    ``s = 1 + xi * z`` is the *only* place the observation enters the GPD family --
+    the log-density, survival, CDF and support mask are all functions of it -- so
+    every builder forms it here, exactly once per call, and reuses the pair. That
+    keeps the one unavoidable precision loss from being re-derived inconsistently:
+    as ``value`` approaches the ``xi < 0`` upper wall ``mu - sigma/xi``, ``t -> -1``
+    and ``s = 1 + t`` cancels catastrophically. That loss is in the *inputs* (once
+    ``value`` is within a few ULP of the wall the low bits of ``s`` are already
+    gone and no rearrangement here recovers them); see the class precision note and
+    the margin-aware entry points for boundary-critical callers.
+    """
     t = _safe_mul(xi, z)
-    return -pt.log(sigma) - pt.log1p(t) - z * _log1p_div(t)
+    return t, pt.log1p(t)
 
 
-def _gpd_log_S(z, xi):
+def _gpd_log_h(z, sigma, t, log_s):
+    """GPD log-density, in-support expression (no support masking)."""
+    return -pt.log(sigma) - log_s - z * _log1p_div(t)
+
+
+def _gpd_log_S(z, t):
     """GPD log survival ``log(1 - H) = -m``, in-support expression.
 
     Computed directly from the survival exponent ``m = log1p(xi z) / xi`` rather
     than as ``log1mexp(log H)``, so it stays exact arbitrarily deep in the upper
     tail (where ``log H -> 0`` and any ``H``-based route underflows).
     """
-    return -(z * _log1p_div(_safe_mul(xi, z)))
+    return -(z * _log1p_div(t))
 
 
-def _gpd_log_H(z, xi):
+def _gpd_log_H(z, t):
     """GPD log-CDF, in-support expression (no support masking / no saturation)."""
-    return pt.log1mexp(_gpd_log_S(z, xi))
+    return pt.log1mexp(_gpd_log_S(z, t))
 
 
 def _gpd_quantile_from_excess(excess, mu, sigma, xi):
@@ -482,9 +498,13 @@ def _gpd_upper_bound(mu, sigma, xi):
     return pt.switch(pt.lt(xi, 0), mu - sigma / xi, np.inf)
 
 
-def _in_gpd_support(z, xi):
-    """Boolean mask of the GPD support: z >= 0 and (for xi < 0) z <= -1/xi."""
-    return pt.and_(z >= 0, 1 + _safe_mul(xi, z) > 0)
+def _in_gpd_support(z, t):
+    """Boolean mask of the GPD support: z >= 0 and (for xi < 0) z <= -1/xi.
+
+    ``t = xi * z``; the upper edge is ``s = 1 + t > 0`` (the same ``t`` the density
+    is built from, so the mask and the value never disagree at the wall).
+    """
+    return pt.and_(z >= 0, 1 + t > 0)
 
 
 def _propagate_nonfinite_shape(result, xi):
@@ -511,7 +531,8 @@ def _propagate_nonfinite_shape(result, xi):
 def gen_pareto_logp(value, mu, sigma, xi):
     """Pure-PyTensor GPD log-density; out-of-support values map to ``-inf``."""
     z = (value - mu) / sigma
-    logp = pt.switch(_in_gpd_support(z, xi), _gpd_log_h(z, sigma, xi), -np.inf)
+    t, log_s = _gpd_tail(z, xi)
+    logp = pt.switch(_in_gpd_support(z, t), _gpd_log_h(z, sigma, t, log_s), -np.inf)
     # The density vanishes at the +inf tail for every xi; for xi > 0 the
     # in-support branch would evaluate log1p(inf)/inf -> nan there, so pin
     # z = +inf to -inf explicitly.
@@ -522,10 +543,11 @@ def gen_pareto_logp(value, mu, sigma, xi):
 def gen_pareto_logcdf(value, mu, sigma, xi):
     """Pure-PyTensor GPD log-CDF."""
     z = (value - mu) / sigma
+    t, _ = _gpd_tail(z, xi)
     # Three regions: below mu -> 0 (log -inf); for xi < 0 past the finite upper
     # endpoint mu - sigma/xi -> 1 (log 0); else log1mexp(-m).
-    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + _safe_mul(xi, z), 0))
-    logcdf = pt.switch(above_upper, 0.0, _gpd_log_H(z, xi))
+    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + t, 0))
+    logcdf = pt.switch(above_upper, 0.0, _gpd_log_H(z, t))
     logcdf = pt.switch(z >= 0, logcdf, -np.inf)
     # CDF -> 1 (logcdf 0) at the +inf tail; for xi > 0 _gpd_log_H(inf) is nan.
     logcdf = pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
@@ -541,9 +563,10 @@ def gen_pareto_logccdf(value, mu, sigma, xi):
     natural ``logsf`` primitive for a peaks-over-threshold model.
     """
     z = (value - mu) / sigma
-    logsf = _gpd_log_S(z, xi)  # log S = -m, exact in the tail
+    t, _ = _gpd_tail(z, xi)
+    logsf = _gpd_log_S(z, t)  # log S = -m, exact in the tail
     # For xi < 0 past the finite upper endpoint, and at the +inf tail, S = 0.
-    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + _safe_mul(xi, z), 0))
+    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + t, 0))
     logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
     # Below mu the survival is 1 (logsf 0).
     logsf = pt.switch(z < 0, 0.0, logsf)
@@ -570,12 +593,13 @@ def gen_pareto_icdf(value, mu, sigma, xi):
 def ext_gen_pareto_logp(value, mu, sigma, xi, kappa):
     """Pure-PyTensor extended-GPD log-density; out-of-support values map to ``-inf``."""
     z = (value - mu) / sigma
+    t, log_s = _gpd_tail(z, xi)
     # log g = log kappa + (kappa - 1) log H + log h. The carrier term vanishes
     # at kappa = 1; guarding it keeps the GPD reduction exact at the lower
     # endpoint (z = 0, log H = -inf), where (kappa - 1) * log H would be 0 * -inf.
-    carrier = pt.switch(pt.eq(kappa, 1.0), 0.0, (kappa - 1) * _gpd_log_H(z, xi))
-    logp = pt.log(kappa) + carrier + _gpd_log_h(z, sigma, xi)
-    logp = pt.switch(_in_gpd_support(z, xi), logp, -np.inf)
+    carrier = pt.switch(pt.eq(kappa, 1.0), 0.0, (kappa - 1) * _gpd_log_H(z, t))
+    logp = pt.log(kappa) + carrier + _gpd_log_h(z, sigma, t, log_s)
+    logp = pt.switch(_in_gpd_support(z, t), logp, -np.inf)
     logp = pt.switch(pt.eq(z, np.inf), -np.inf, logp)
     return _propagate_nonfinite_shape(logp, xi)
 
@@ -583,8 +607,9 @@ def ext_gen_pareto_logp(value, mu, sigma, xi, kappa):
 def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
     """Pure-PyTensor extended-GPD log-CDF."""
     z = (value - mu) / sigma
-    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + _safe_mul(xi, z), 0))
-    logcdf = pt.switch(above_upper, 0.0, kappa * _gpd_log_H(z, xi))
+    t, _ = _gpd_tail(z, xi)
+    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + t, 0))
+    logcdf = pt.switch(above_upper, 0.0, kappa * _gpd_log_H(z, t))
     logcdf = pt.switch(z >= 0, logcdf, -np.inf)
     logcdf = pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
     return _propagate_nonfinite_shape(logcdf, xi)
@@ -608,14 +633,15 @@ def ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa):
       kappa up to 1e20.
     """
     z = (value - mu) / sigma
-    a = _gpd_log_S(z, xi)  # log(1 - H), exact in the tail
+    t, _ = _gpd_tail(z, xi)
+    a = _gpd_log_S(z, t)  # log(1 - H), exact in the tail
     log_H = pt.log1mexp(a)
     generic = pt.log1mexp(kappa * log_H)
     s = pt.exp(a)  # S_gpd, tiny in the tail
     series = 1.0 - (kappa - 1) / 2.0 * s + (kappa - 1) * (kappa - 2) / 6.0 * s**2
     tail = pt.log(kappa) + a + pt.log1p(series - 1.0)
     logsf = pt.switch(pt.log(kappa) + a < -30.0, tail, generic)
-    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + _safe_mul(xi, z), 0))
+    above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + t, 0))
     logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
     logsf = pt.switch(z < 0, 0.0, logsf)
     return _propagate_nonfinite_shape(logsf, xi)
@@ -787,6 +813,22 @@ class GenPareto(Continuous):
     or integration, and :math:`\xi \leq -1` corresponds to an extremely
     short-tailed regime that rarely arises in practice.
 
+    **Numerical precision near the** :math:`\xi < 0` **wall.** The family is built
+    on :math:`s = 1 + \xi (x - \mu)/\sigma`, which cancels toward :math:`0` as
+    :math:`x \to x_F^-`. The log-density *value* keeps near-machine relative
+    accuracy there (it is :math:`\sim |1 + 1/\xi|\,\log s`, large in magnitude),
+    but its gradient with respect to :math:`\sigma` and :math:`\xi` contains
+    :math:`\sim z/s` terms that inherit the lost low bits of :math:`s` and are
+    accurate only to a *relative* :math:`\sim \varepsilon/s` (about 3 significant
+    figures once :math:`x` is within :math:`\sim 10^{-13}` of the wall). This is a
+    representability limit of the float64 *input* :math:`x` -- once it is within a
+    few ULP of :math:`x_F` the low bits of :math:`s` are already gone and no
+    rearrangement of ``logp(x, ...)`` recovers them. A model that can form the
+    margin :math:`s` directly without computing :math:`1 + \xi z` -- e.g. a
+    peaks-over-threshold model that knows the wall exactly -- avoids the loss, so
+    gradient-critical callers working right at the boundary should parameterize in
+    terms of that margin.
+
     Examples
     --------
     .. code-block:: python
@@ -929,7 +971,11 @@ class ExtGenPareto(Continuous):
     for :math:`\xi < 0`, ``logp`` is :math:`-\infty` and ``logcdf`` is :math:`0`
     at and beyond the finite right endpoint :math:`\mu - \sigma/\xi`. See the
     Notes on :class:`GenPareto` for the (measure-zero) boundary behaviour at
-    :math:`\xi \leq -1`.
+    :math:`\xi \leq -1`, and for the relative-precision limit of ``logp`` and its
+    :math:`\sigma`/:math:`\xi` gradient as :math:`x` approaches that wall (the
+    same :math:`s = 1 + \xi z` cancellation applies here). The :math:`\kappa`
+    gradient is exempt -- its carrier term :math:`\log H` has no :math:`1/s`
+    factor and stays accurate to machine precision at the wall.
 
     Examples
     --------
