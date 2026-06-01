@@ -464,6 +464,44 @@ class TestExtGenParetoClass:
             expected = np.full(size, expected)
         assert_support_point_is_expected(model, expected)
 
+    @pytest.mark.parametrize("kappa", [0.5, 0.05, 0.01])
+    def test_small_kappa_inverses_share_the_stable_excess(self, kappa):
+        # icdf, the default transform's backward and support_point all invert the
+        # carrier with the same log1mexp helper, so for small kappa they agree and
+        # stay strictly above mu instead of collapsing onto it. A -log(-expm1(.))
+        # form rounds the tiny GPD survival 1 - q ** (1/kappa) to 1, sending the
+        # excess to 0 -> the lower endpoint -> a -inf initial logp. mu = 0 keeps
+        # the (tiny) median representable; probed where ref_ext_icdf is itself exact.
+        mu, sigma = 0.0, 1.0
+        median = ref_ext_icdf(0.5, mu, sigma, 0.0, kappa)
+        assert median > mu
+
+        icdf_half = float(
+            pm.icdf(ExtGenPareto.dist(mu=mu, sigma=sigma, xi=0.0, kappa=kappa), 0.5).eval()
+        )
+        np.testing.assert_allclose(icdf_half, median, rtol=1e-9)
+
+        with pm.Model() as model:
+            ExtGenPareto("x", mu=mu, sigma=sigma, xi=0.0, kappa=kappa)
+        rv = model.free_RVs[0]
+        tr = model.rvs_to_transforms[rv]
+        backward0 = float(tr.backward(np.array(0.0), *rv.owner.inputs).eval())
+        np.testing.assert_allclose(backward0, median, rtol=1e-9)  # y = logit(0.5) = 0
+
+        assert_support_point_is_expected(model, np.array(median))
+        assert np.isfinite(model.compile_logp()(model.initial_point()))
+
+    def test_small_kappa_draws_do_not_collapse_to_mu(self):
+        # The stable carrier inverse keeps small-kappa draws off the lower endpoint:
+        # at kappa = 0.01 essentially none round to mu, whereas the unstable
+        # -log(-expm1(.)) form sent the majority there (1 - u ** (1/kappa) -> 1).
+        draws = pm.draw(
+            ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.0, kappa=0.01, size=20_000),
+            random_seed=7,
+        )
+        assert (draws >= 0.0).all()  # support is [mu, inf)
+        assert np.mean(draws == 0.0) < 0.01
+
     def test_rng_matches_distribution(self):
         # No SciPy equivalent: check that the empirical CDF (the model's own
         # logcdf) of the draws is Uniform(0, 1) via a KS test.
