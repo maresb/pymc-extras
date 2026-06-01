@@ -22,6 +22,7 @@ import scipy.stats.distributions as sp
 
 
 # test support imports from pymc
+from pymc.distributions.distribution import support_point as _support_point
 from pymc.logprob.utils import ParameterValueError
 from pymc.testing import (
     BaseTestDistributionRandom,
@@ -501,6 +502,27 @@ class TestExtGenParetoClass:
         )
         assert (draws >= 0.0).all()  # support is [mu, inf)
         assert np.mean(draws == 0.0) < 0.01
+
+    @pytest.mark.parametrize("kappa", [1e-4, 1e-8, 1e-300])
+    def test_support_point_falls_back_when_median_collapses(self, kappa):
+        # When kappa is small enough that the ExtGPD median rounds onto mu (which
+        # transforms to a -inf initial point), support_point falls back to the
+        # underlying GPD median (excess = log 2) -- a higher quantile that is
+        # representably interior for any kappa -- so the default initial logp is
+        # finite over the whole kappa > 0 domain. mu = 2 makes even kappa = 1e-4
+        # collapse (the tiny median excess is below ULP(mu)).
+        mu, sigma = 2.0, 1.5
+        with pm.Model() as model:
+            ExtGenPareto("x", mu=mu, sigma=sigma, xi=0.0, kappa=kappa)
+        rv = model.free_RVs[0]
+        sp = float(_support_point(rv).eval())
+        expected_fallback = mu + sigma * np.log(2.0)  # GPD median, xi = 0
+        np.testing.assert_allclose(sp, expected_fallback, rtol=1e-12)
+        assert sp > mu
+        # The headline fix: a finite default initial logp for every kappa > 0
+        # (the forward map is logcdf - logccdf in log space, finite even when the
+        # transformed point is deep, e.g. y ~ 691 for kappa = 1e-300).
+        assert np.isfinite(model.compile_logp()(model.initial_point()))
 
     def test_rng_matches_distribution(self):
         # No SciPy equivalent: check that the empirical CDF (the model's own
