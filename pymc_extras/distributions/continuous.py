@@ -1016,13 +1016,23 @@ class _GPDProbabilityIntegralTransform(Transform):
       ``|y| ~ 60``.
 
     Beyond those points the transformed logp is ``-inf`` / ``nan``. For
-    ``ExtGenPareto`` the excess is recovered from the survival side with a tail
-    asymptotic (see ``_ExtGenParetoPIT._excess_from_y``), so its reach matches the
+    ``ExtGenPareto`` the upper tail also recovers the excess from the survival
+    side (see ``_ExtGenParetoPIT._excess_from_y``), so its ``xi`` reach matches the
     base family rather than underflowing early near ``y ~ 745``. All of these
     bounds are far past any sampler's reach (``y = 60`` is a tail probability of
     ``~e^-60``), and within them the transformed density is exactly Logistic
     (xi-free) and divergence-free -- but the map is *not* finite on all of ``R``
     for every parameter.
+
+    ``ExtGenPareto`` adds one more axis, ``kappa``. Inverting the carrier needs
+    ``H = F_ext ** (1 / kappa)`` resolvable from ``1``, which keeps ``~exp(-|y|)``
+    of headroom in ``kappa``: the map is exact for ``kappa`` down to roughly
+    ``exp(-|y|)`` (e.g. ``kappa >~ 1e-15`` at ``|y| = 40``, ``>~ 1e-32`` at
+    ``|y| = 80``), so any fixed ``kappa > 0`` is exact out to ``|y| ~ log(1 /
+    kappa)`` -- well past where a sampler goes for ordinary shape values. For
+    ``kappa`` smaller than that the carrier underflows and the excess rounds
+    toward ``0`` (``x -> mu``, still *in support*, transformed logp ``-> -inf``);
+    it never leaves the support.
 
     Subclasses provide the family's ``_logp`` / ``_logcdf`` / ``_logccdf`` and the
     survival-space ``_excess_from_y``; ``inputs`` are the RV's owner inputs, so
@@ -1084,27 +1094,29 @@ class _ExtGenParetoPIT(_GPDProbabilityIntegralTransform):
     def _excess_from_y(value, mu, sigma, xi, kappa):
         # m = -log(S_F), the GPD-survival exponent, recovered from y = logit(F_ext).
         #
-        # Bulk: S_F = 1 - F_ext**(1/kappa) with log F_ext = -softplus(-y). That log
-        # underflows to exactly 0 near y ~ 745 (softplus(-y) rounds to 0), sending
-        # S_F -> 0 and m -> inf while the quantile is still finite -- so the bulk
-        # form is used only where t = softplus(y) < 40 (no underflow there; since
-        # softplus(y) > y always, t < 40 implies value < 40, so the clamp below is
-        # a no-op on the selected region and merely keeps the *discarded* branch
-        # finite when value is large).
+        # Bulk (value < 700): the ExtGPD carrier H = F_ext ** (1 / kappa) gives GPD
+        # survival S_F = 1 - H, so m = -log(S_F) = -log1mexp(log F_ext / kappa) with
+        # log F_ext = -softplus(-y) (pt.log1mexp(a) = log(1 - exp(a)) for a <= 0).
+        # Using log1mexp -- whose log1p branch never forms ``1 - H`` -- keeps m exact
+        # when S_F is tiny: for small kappa H rounds to 1, and ``-log(-expm1(.))``
+        # would collapse the excess to 0, but log1mexp returns the true ~e^{-Q}.
+        # This is the exact inverse, so it round-trips for every kappa down to where
+        # H itself underflows (the heavy carrier needs ~e^{-|y|} headroom in kappa;
+        # see the class docstring's kappa note).
         #
-        # Tail: in the far upper tail S_ext = exp(-softplus(y)) is tiny and
-        #   S_F = 1 - (1 - S_ext)**(1/kappa) ~ S_ext / kappa,  giving
-        #   m -> t + log(kappa) - log(_log1p_div(-exp(-t))),  t = softplus(y).
-        # This never forms exp(-y) before a log, so when exp(-t) underflows to 0 the
-        # C1 helper returns its limit 1 and m = t + log(kappa) stays finite until t
-        # itself overflows float64. The two forms agree to machine precision at
-        # t ~ 40 (the correction is O(exp(-t))), so the switch is C1 there.
+        # Tail (value >= 700): log F_ext = -softplus(-y) rounds to 0 near y ~ 745,
+        # sending m -> inf though the quantile is finite. There S_ext = exp(-t) is
+        # tiny (t = softplus(y)) and S_F ~ S_ext / kappa, so
+        #   m -> t + log(kappa) - log(_log1p_div(-exp(-t))),
+        # built without forming exp(-y) before a log, finite until t overflows. The
+        # two branches agree to machine precision at the switch, and both run on
+        # clamped inputs so the discarded one (and its gradient) stays finite.
         t = pt.softplus(value)
-        log_F = -pt.softplus(-pt.minimum(value, 40.0))
-        m_bulk = -pt.log(-pt.expm1(log_F / kappa))
-        s = pt.exp(-pt.maximum(t, 40.0))  # >= 40 keeps _log1p_div finite off-branch
+        log_F = -pt.softplus(-pt.minimum(value, 700.0))
+        m_bulk = -pt.log1mexp(log_F / kappa)
+        s = pt.exp(-pt.maximum(t, 700.0))
         m_tail = t + pt.log(kappa) - pt.log(_log1p_div(-s))
-        return pt.switch(t < 40.0, m_bulk, m_tail)
+        return pt.switch(value < 700.0, m_bulk, m_tail)
 
     @staticmethod
     def _quantile_from_excess(excess, mu, sigma, xi, kappa):
