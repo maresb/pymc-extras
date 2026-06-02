@@ -725,6 +725,18 @@ class TestGenParetoHeavyTail:
         small = np.log(kappa) - x < -30.0
         np.testing.assert_allclose(got[small], (np.log(kappa) - x)[small], rtol=1e-9)
 
+    @pytest.mark.parametrize("kappa", [1e-50, 1e-100, 1e-2])
+    def test_ext_logccdf_small_kappa_in_the_body_matches_reference(self, kappa):
+        # For small kappa, log(kappa) + a < -30 holds even where S_gpd ~ 1 (the body,
+        # x = O(1)), so the tail branch must NOT trigger there: the leading behaviour
+        # is log(1 - H**kappa) ~ log(kappa) + log(-log H), not log(kappa) + log(1 - H).
+        # The gate keys on S_gpd being small too, so the body uses the exact generic
+        # branch. xi = 0: 1 - H**kappa = -expm1(kappa * log1p(-exp(-x))).
+        x = np.array([0.01, 0.1, 0.5, 2.0])
+        got = pm.logccdf(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.0, kappa=kappa), x).eval()
+        ref = np.log(-np.expm1(kappa * np.log1p(-np.exp(-x))))
+        np.testing.assert_allclose(got, ref, rtol=1e-9)
+
 
 class TestGenParetoBoundaryPrecision:
     """Precision of logp / gradient as ``value`` approaches the ``xi < 0`` wall.
@@ -921,13 +933,14 @@ class TestGenParetoTransforms:
             np.testing.assert_allclose(lp, logistic, atol=1e-6)
 
     @pytest.mark.parametrize("xi", [5.0, 3.0])
-    def test_heavy_tail_transform_logp_is_logistic_where_the_quantile_overflows(self, xi):
-        # The transformed density is exactly Logistic(y) over the whole real line by
-        # the PIT construction, so the logp the sampler sees stays finite and correct
-        # even past the heavy-tail point y ~ 709/xi where the recovered quantile
-        # x = backward(y) ~ exp(xi * m) overflows float64. (Beyond that the latent
-        # value itself is unrepresentable, so backward returns +inf -- an honest
-        # limit on recovering x, not on the transformed logp.)
+    def test_heavy_tail_transform_saturates_past_709_over_xi(self, xi):
+        # Below the heavy-tail point y ~ 709/xi the transformed logp is exactly
+        # Logistic(y). Past it the recovered quantile x = backward(y) ~ exp(xi*m)
+        # overflows float64 to +inf, so logp(backward) = -inf; the transformed logp
+        # then saturates to -inf (finite-graph robust -- it is *not* a NaN, since
+        # log_jac_det floors that -inf -- but it is no longer the true Logistic
+        # value, the honest representability limit). This y is utterly unreachable
+        # (a tail probability of ~e^-(709/xi)).
         with pm.Model() as model:
             x = GenPareto("x", mu=0.0, sigma=1.0, xi=xi)
         yv = model.value_vars[0]
@@ -936,14 +949,41 @@ class TestGenParetoTransforms:
         transformed_logp = pytensor.function([yv], model.logp(sum=True))
         backward = pytensor.function([yv], tr.backward(yv, *inputs))
         boundary = 709.0 / xi
-        for y in (boundary * 0.8, boundary * 1.5, boundary * 3.0):
-            lp = float(transformed_logp(y))
-            assert np.isfinite(lp)
-            np.testing.assert_allclose(lp, -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y), atol=1e-6)
-        # The recovered quantile is representable just below the boundary and
-        # overflows to +inf past it.
-        assert np.isfinite(float(backward(boundary * 0.8)))
+        y_inside = boundary * 0.8
+        lp = float(transformed_logp(y_inside))
+        assert np.isfinite(lp)
+        np.testing.assert_allclose(
+            lp, -np.logaddexp(0.0, y_inside) - np.logaddexp(0.0, -y_inside), atol=1e-6
+        )
+        assert np.isfinite(float(backward(y_inside)))
+        # Past the float64 ceiling: quantile overflows, transformed logp -> -inf
+        # (not NaN).
         assert not np.isfinite(float(backward(boundary * 1.5)))
+        assert float(transformed_logp(boundary * 1.5)) == -np.inf
+
+    def test_transformed_logp_robust_in_unoptimized_mode(self):
+        # The transformed logp must not depend on the optimizer cancelling
+        # logp(backward) against log_jac_det. In an unoptimized (fast_compile) graph
+        # the actual numbers are evaluated; the construction must still avoid
+        # +inf - inf = NaN. Over the whole sampler-reachable range, for bounded /
+        # unbounded GPD and small-kappa ExtGPD (lower-tail quantile collapsing onto
+        # mu), the transformed logp is finite and exactly Logistic -- no NaN.
+        fast = pytensor.compile.mode.Mode(linker="py", optimizer="fast_compile")
+        cases = [
+            (GenPareto, {"mu": 2.0, "sigma": 1.5, "xi": -0.5}),
+            (GenPareto, {"mu": 0.0, "sigma": 1.0, "xi": 0.3}),
+            (ExtGenPareto, {"mu": 2.0, "sigma": 1.0, "xi": 0.0, "kappa": 0.0067}),
+            (ExtGenPareto, {"mu": 0.0, "sigma": 1e-50, "xi": 0.0, "kappa": 0.0067}),
+        ]
+        for builder, kw in cases:
+            with pm.Model() as model:
+                builder("x", **kw)
+            fn = pytensor.function([model.value_vars[0]], model.logp(sum=True), mode=fast)
+            for y in np.linspace(-25.0, 25.0, 51):
+                lp = float(fn(y))
+                assert not np.isnan(lp), (builder.__name__, kw, y)
+                logistic = -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y)
+                np.testing.assert_allclose(lp, logistic, atol=1e-3)
 
     @pytest.mark.parametrize(
         "kappa, ys",

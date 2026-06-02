@@ -637,17 +637,23 @@ def ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa):
     a = _gpd_log_S(z, t)  # log(1 - H), exact in the tail
     log_H = pt.log1mexp(a)
     generic = pt.log1mexp(kappa * log_H)
-    s = pt.exp(a)  # S_gpd, tiny in the tail
-    # 1 - H**kappa = kappa S_gpd [1 - (kappa-1)/2 S_gpd + (kappa-1)(kappa-2)/6 S_gpd**2 - ...].
-    # Keep only the first-order correction: the tail branch is taken when
-    # log(kappa) + a < -30, i.e. kappa S_gpd < e^-30, so the dropped second-order
-    # term is ~(kappa S_gpd)**2 < e^-60 -- far below the float64 precision of the
-    # result. (Forming (kappa-1)(kappa-2) explicitly overflows for huge finite
-    # kappa, e.g. ~1e155, then multiplies an underflowed S_gpd**2 -> 0, giving nan;
-    # the first-order term has a single kappa factor and stays finite.)
-    series = 1.0 - (kappa - 1) / 2.0 * s
-    tail = pt.log(kappa) + a + pt.log1p(series - 1.0)
-    logsf = pt.switch(pt.log(kappa) + a < -30.0, tail, generic)
+    s = pt.exp(a)  # S_gpd
+    # r = kappa * S_gpd, formed via exp(log kappa + a) and capped at 1 so the
+    # unused (generic-branch) tail expression cannot overflow; in the tail branch
+    # below r < e^-30.
+    r = pt.exp(pt.minimum(pt.log(kappa) + a, 0.0))
+    # 1 - H**kappa = kappa S [1 + (s - r)/2 + (r**2 - 3 r s + 2 s**2)/6 + ...].
+    # This is a Taylor expansion in *both* S_gpd and kappa*S_gpd, so it is only
+    # valid where both are small; writing it in r = kappa S and s = S keeps every
+    # term bounded (no kappa**k powers, which overflow for huge kappa).
+    series_m1 = (s - r) / 2.0 + (r * r - 3.0 * r * s + 2.0 * s * s) / 6.0
+    tail = pt.log(kappa) + a + pt.log1p(series_m1)
+    # Use the tail expansion only where the generic log1mexp(kappa log H) underflows
+    # (S_gpd itself tiny, a very negative) AND the expansion is valid (kappa*S_gpd
+    # also small). Gating on kappa*S_gpd alone is wrong: for tiny kappa it holds
+    # even when S_gpd ~ 1, i.e. in the body, where the generic branch is correct
+    # (log(1 - H**kappa) ~ log(kappa) + log(-log H), not log(kappa) + log(1 - H)).
+    logsf = pt.switch(pt.and_(a < -30.0, pt.log(kappa) + a < -30.0), tail, generic)
     above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + t, 0))
     logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
     logsf = pt.switch(z < 0, 0.0, logsf)
@@ -1140,26 +1146,27 @@ class _GPDProbabilityIntegralTransform(Transform):
     for the base family), and ``log_jac_det`` uses the analytic
     ``log F + log S - logp(x)`` rather than autodiffing the quantile graph.
 
-    Range of validity. The transformed density is exactly Logistic(y) over all of
-    ``R`` by the probability-integral construction, and ``log_jac_det`` returns that
-    target directly (= ``-softplus(y) - softplus(-y) - logp(backward(y))``), so the
-    *transformed logp the sampler sees is always finite and correct*, independent of
-    ``mu`` / ``sigma`` / ``xi`` / ``kappa``. What saturates in the far tails is only
-    the recovery of the latent value itself, ``x = backward(y)``:
+    Range of validity. ``log_jac_det`` computes the Jacobian as ``-softplus(y) -
+    softplus(-y) - logp(backward(y))`` (the first two terms are ``log F + log S``,
+    which the PIT makes the standard Logistic), so the framework's
+    ``logp(backward) + log_jac_det`` cancels to *exactly* Logistic(y) -- finite and
+    correct -- wherever ``x = backward(y)`` is *representable* and ``logp(x)`` is
+    finite. That covers the entire sampler-reachable range for every parameter,
+    including the small-``kappa`` lower tail (``kappa < ~|y| / 745``) where the
+    carrier excess underflows and ``x`` collapses onto ``mu``: ``backward`` floors
+    ``x`` just inside the open support so ``logp(x)`` stays finite (a ``kappa < 1``
+    density diverges at ``mu``), and the floor combines ``|mu| * 8 eps`` with a
+    fixed ``1e-300`` so it does not underflow for tiny ``sigma``.
 
-    * Heavy upper tail (``xi > 0``): ``x ~ exp(xi * m)`` overflows ``float64`` at
-      roughly ``y ~ 709 / xi`` (e.g. ``y ~ 142`` for ``xi = 5``); past that
-      ``backward`` returns ``+inf`` (the quantile is genuinely unrepresentable).
-    * Deep lower tail with small ``kappa`` (``ExtGenPareto``): the carrier excess
-      underflows once ``kappa < ~|y| / 745``, collapsing ``x`` onto the lower
-      endpoint; ``backward`` floors it just inside the open support (so
-      ``logp(backward)`` stays finite -- the ``kappa < 1`` density diverges at
-      ``mu`` -- which is what keeps the transformed logp finite there).
-    * Bounded ``xi < 0``: ``x`` asymptotes to the upper wall ``mu - sigma/xi``.
+    Only the *unreachable* far upper tail is not exact: once the quantile overflows
+    (``xi > 0``, ``y >~ 709 / xi``) or rounds onto the bounded wall, ``backward``
+    saturates (to ``+inf`` or the endpoint) and ``logp(backward) = -inf``. The
+    ``-1e300`` floor on the subtracted ``logp`` keeps ``log_jac_det`` finite there,
+    so the transformed logp is ``-inf`` -- *not* the true Logistic value, but
+    robustly ``-inf`` rather than ``NaN`` (it does not rely on the optimizer
+    cancelling the two ``logp`` terms, so an unoptimized graph is safe too). These
+    points are a tail probability of ``~e^-(709/xi)`` and never reached.
 
-    All of these lie far past any sampler's reach (``|y| = 60`` is a tail
-    probability of ``~e^-60``); the transformed logp stays exactly Logistic through
-    them, and only the *recovered x* saturates to ``+inf`` or the support endpoints.
     The default starting point is interior and finite-logp: ``support_point``
     returns the median, or the underlying GPD median when the ExtGPD median rounds
     onto ``mu`` (the sole exception being the general representability limit where
@@ -1193,33 +1200,37 @@ class _GPDProbabilityIntegralTransform(Transform):
 
     def backward(self, value, *inputs):
         params = inputs[2:]
-        mu, sigma = params[0], params[1]
+        mu = params[0]
         x = self._quantile_from_excess(self._excess_from_y(value, *params), *params)
-        # Keep x strictly inside the open support (z > 0). Deep in the lower tail
-        # the excess underflows to 0 and x rounds onto mu; for kappa < 1 the ExtGPD
-        # density diverges there (logp(mu) = +inf), which would make the framework's
-        # logp(backward(y)) non-finite and the transformed logp +inf - inf = nan
-        # (platform-dependent: -inf on some, nan on others). The floor only binds
-        # once x has already collapsed onto mu, and the transformed logp is exactly
-        # Logistic by construction (see log_jac_det), so the floored value is
-        # immaterial; it just keeps logp(x) finite so the construction is robust.
+        # Floor x above mu so logp(x) cannot be +inf. Deep in the lower tail the
+        # excess underflows to 0 and x rounds onto mu, where a kappa < 1 ExtGPD
+        # density diverges (logp(mu) = +inf); the framework's logp(backward(y)) would
+        # then be +inf and the transformed logp +inf - inf = NaN. The floor combines
+        # a relative term (|mu| * 8 eps, to clear mu's ULP) and a fixed absolute term
+        # (1e-300, a normal double that does not underflow for tiny sigma -- the
+        # earlier sigma * 1e-300 vanished for e.g. sigma = 1e-50). It only binds once
+        # x has already collapsed onto mu; the transformed logp is Logistic by
+        # construction (see log_jac_det), so the floored value is immaterial.
         eps = np.finfo("float64").eps
-        floor = pt.abs(mu) * (8.0 * eps) + sigma * 1e-300
+        floor = pt.abs(mu) * (8.0 * eps) + 1e-300
         return pt.maximum(x, mu + floor)
 
     def log_jac_det(self, value, *inputs):
         params = inputs[2:]
         x = self.backward(value, *inputs)
-        # By the probability-integral construction the transformed density is
-        # exactly Logistic(value): with F(x) = sigmoid(value),
-        #   log f_x(x) + log|dx/dy| = log F + log(1 - F) = -softplus(value) - softplus(-value).
-        # Compute that target directly (it is robust where x has collapsed onto the
-        # boundary and logcdf(x) + logccdf(x) would be -inf) and return it minus the
-        # density, so logp(backward) + log_jac_det == the Logistic log-density. The
-        # logp(x) terms cancel; backward keeps logp(x) finite so the cancellation is
-        # exact rather than +inf - inf.
+        # The PIT transformed density is exactly Logistic(value): with F(x) =
+        # sigmoid(value), log f_x(x) + log|dx/dy| = log F + log(1 - F) =
+        # -softplus(value) - softplus(-value). Return that target minus logp(x); the
+        # framework adds logp(backward(value)), so the two logp(x) cancel and the
+        # transformed logp is exactly the Logistic log-density wherever x is
+        # representable. The logp(x) here is floored at -1e300 so that, at the
+        # *unreachable* upper saturation where the quantile overflows (xi > 0,
+        # y >~ 709/xi) or hits the bounded wall and logp(backward) = -inf, this term
+        # stays finite and the total is -inf rather than -inf + inf = NaN -- robust
+        # without relying on the optimizer cancelling the two logp(x). (No reachable
+        # x gives logp below ~-1e3, so the floor never perturbs a valid value.)
         logistic = -pt.softplus(value) - pt.softplus(-value)
-        return logistic - self._logp(x, *params)
+        return logistic - pt.maximum(self._logp(x, *params), -1e300)
 
 
 class _GenParetoPIT(_GPDProbabilityIntegralTransform):
