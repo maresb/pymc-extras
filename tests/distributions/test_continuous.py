@@ -709,12 +709,15 @@ class TestGenParetoHeavyTail:
             assert np.all(np.isfinite(got))
             np.testing.assert_allclose(got, np.log(kappa) - x, rtol=1e-9)
 
-    @pytest.mark.parametrize("kappa", [10.0, 1e6, 1e20])
+    @pytest.mark.parametrize("kappa", [10.0, 1e6, 1e20, 1e155, 1e300])
     def test_ext_logccdf_is_a_valid_log_probability_for_large_kappa(self, kappa):
         # A log survival probability is always <= 0. The tail branch must key on
         # kappa * S (not just the GPD survival), or large kappa makes
         # log(kappa) + (-x) positive. xi = 0 -> survival = 1 - (1 - e^-x)^kappa;
-        # the exact tail value is log(kappa) - x when kappa * e^-x << 1.
+        # the exact tail value is log(kappa) - x when kappa * e^-x << 1. The huge
+        # kappa cases (>= 1e155) guard the tail series: forming (kappa-1)(kappa-2)
+        # overflows float64 (~1e310) and times an underflowed S^2 gives NaN, so the
+        # series keeps only the first-order, single-kappa-factor term.
         x = np.array([40.0, 100.0, 1000.0])
         got = pm.logccdf(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.0, kappa=kappa), x).eval()
         assert np.all(got <= 0.0)
@@ -918,24 +921,29 @@ class TestGenParetoTransforms:
             np.testing.assert_allclose(lp, logistic, atol=1e-6)
 
     @pytest.mark.parametrize("xi", [5.0, 3.0])
-    def test_heavy_tail_transform_overflows_only_past_709_over_xi(self, xi):
-        # Honest bound, not an over-claim: for a heavy upper tail the quantile
-        # x = backward(y) ~ exp(xi * m) overflows float64 around y ~ 709 / xi.
-        # The transform is exact a comfortable margin below that boundary (which
-        # is itself a tail probability of ~e^-(709/xi), unreachable in practice),
-        # and -inf beyond it -- a representability limit on x, not a bug.
+    def test_heavy_tail_transform_logp_is_logistic_where_the_quantile_overflows(self, xi):
+        # The transformed density is exactly Logistic(y) over the whole real line by
+        # the PIT construction, so the logp the sampler sees stays finite and correct
+        # even past the heavy-tail point y ~ 709/xi where the recovered quantile
+        # x = backward(y) ~ exp(xi * m) overflows float64. (Beyond that the latent
+        # value itself is unrepresentable, so backward returns +inf -- an honest
+        # limit on recovering x, not on the transformed logp.)
         with pm.Model() as model:
-            GenPareto("x", mu=0.0, sigma=1.0, xi=xi)
+            x = GenPareto("x", mu=0.0, sigma=1.0, xi=xi)
         yv = model.value_vars[0]
+        tr = model.rvs_to_transforms[x]
+        inputs = x.owner.inputs
         transformed_logp = pytensor.function([yv], model.logp(sum=True))
+        backward = pytensor.function([yv], tr.backward(yv, *inputs))
         boundary = 709.0 / xi
-        y_inside = boundary * 0.8
-        lp = float(transformed_logp(y_inside))
-        np.testing.assert_allclose(
-            lp, -np.logaddexp(0.0, y_inside) - np.logaddexp(0.0, -y_inside), atol=1e-6
-        )
-        # Past the float64 ceiling the quantile is +inf, so the logp is not finite.
-        assert not np.isfinite(float(transformed_logp(boundary * 1.5)))
+        for y in (boundary * 0.8, boundary * 1.5, boundary * 3.0):
+            lp = float(transformed_logp(y))
+            assert np.isfinite(lp)
+            np.testing.assert_allclose(lp, -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y), atol=1e-6)
+        # The recovered quantile is representable just below the boundary and
+        # overflows to +inf past it.
+        assert np.isfinite(float(backward(boundary * 0.8)))
+        assert not np.isfinite(float(backward(boundary * 1.5)))
 
     @pytest.mark.parametrize(
         "kappa, ys",
@@ -972,30 +980,29 @@ class TestGenParetoTransforms:
             np.testing.assert_allclose(lp, logistic, atol=1e-6)
             np.testing.assert_allclose(float(roundtrip(y)), y, atol=1e-6)
 
-    @pytest.mark.parametrize("kappa", [1e-20, 1e-100, 1e-300])
-    def test_extgenpareto_transform_stays_in_support_for_tiny_kappa(self, kappa):
-        # Below the exact-kappa domain the carrier underflows, but the recovered
-        # quantile must stay finite and >= mu (in support) -- never the negative
-        # excess (x < mu) that a y-only tail switch produced. This is the robust
-        # guarantee, and the regression for that bug.
-        #
-        # We deliberately do NOT assert on the *transformed* logp here: at this
-        # depth the excess underflows to exactly 0, so x collapses onto mu, where a
-        # kappa < 1 density diverges (logp = +inf). PyMC forms the transformed logp
-        # as logp(backward(y)) + log_jac_det(y), an unavoidable +inf - inf
-        # indeterminate there -- pytensor yields -inf on some platforms and nan on
-        # others. That is the documented sub-~1e-15 kappa floor (a numerical point
-        # mass at mu), not a defect the transform can resolve; practical kappa keep
-        # the excess nonzero and the transformed logp finite.
+    @pytest.mark.parametrize("kappa", [1e-2, 1e-20, 1e-100, 1e-300])
+    def test_extgenpareto_transform_finite_logistic_for_small_kappa(self, kappa):
+        # Regression for the small-kappa transform NaN. For kappa < ~|y|/745 the
+        # carrier excess underflows and the quantile collapses onto mu, where a
+        # kappa < 1 density diverges (logp = +inf). The transform still returns the
+        # exact Logistic(y) transformed logp -- finite -- rather than the +inf - inf
+        # NaN a logcdf(x) + logccdf(x) route produced (kappa = 1e-2 at y = -10 was
+        # already in this regime, not just absurdly small kappa). The recovered
+        # quantile stays finite and in support (>= mu).
+        mu = 2.0
         with pm.Model() as model:
-            ExtGenPareto("x", mu=2.0, sigma=1.0, xi=0.0, kappa=kappa)
-        rv = model.free_RVs[0]
+            x = ExtGenPareto("x", mu=mu, sigma=1.0, xi=0.0, kappa=kappa)
         yv = model.value_vars[0]
-        tr = model.rvs_to_transforms[rv]
-        backward = pytensor.function([yv], tr.backward(yv, *rv.owner.inputs))
-        for y in (-30.0, 0.0, 30.0, 80.0):
-            x = float(backward(y))
-            assert np.isfinite(x) and x >= 2.0  # in support [mu, inf)
+        tr = model.rvs_to_transforms[x]
+        inputs = x.owner.inputs
+        logp = pytensor.function([yv], model.logp(sum=True))
+        backward = pytensor.function([yv], tr.backward(yv, *inputs))
+        for y in (-30.0, -10.0, 0.0, 30.0, 80.0):
+            lp = float(logp(y))
+            assert np.isfinite(lp)
+            np.testing.assert_allclose(lp, -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y), atol=1e-6)
+            xb = float(backward(y))
+            assert np.isfinite(xb) and xb >= mu  # in support [mu, inf)
 
     def test_jacobian_gradient_is_continuous_through_xi_zero(self):
         # The headline reason for the probability-integral transform: with xi a
