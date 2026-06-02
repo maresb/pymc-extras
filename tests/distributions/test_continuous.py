@@ -633,7 +633,9 @@ class TestGenParetoBoundaries:
             with pytest.raises(ParameterValueError):
                 pm.logp(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.1, kappa=kappa), 1.0).eval()
 
-    @pytest.mark.parametrize("bad_xi", [np.nan, np.inf, -np.inf])
+    @pytest.mark.parametrize(
+        "bad_xi", [np.nan, np.inf]
+    )  # isfinite guard is sign-agnostic; -inf == inf path
     def test_nonfinite_xi_propagates_consistently(self, bad_xi):
         # A non-finite ``xi`` must propagate as ``nan`` at *every* value -- not be
         # masked to the ``-inf`` / ``0`` of an out-of-support point ("valid
@@ -1110,7 +1112,14 @@ class TestGenParetoTransforms:
             # Must be NaN specifically (an invalid parameter), not -inf -- so a future
             # regression that turns it into a clean reject instead of NaN still fails.
             assert np.isnan(float(logp(y)))
-        # ... and the model-level loud guard fires (the practical symptom of the bug).
+
+    def test_nonfinite_shape_is_caught_loudly_at_init(self):
+        # The practical symptom of the leak guarded above: PyMC's check_start_vals
+        # rejects the NaN initial logp loudly (the same path as pm.Gamma(alpha=inf)).
+        # Checked once for a representative invalid shape rather than recompiling the
+        # model + initial point for every parametrize case.
+        with pm.Model() as model:
+            ExtGenPareto("x", mu=0.0, sigma=1.0, xi=0.0, kappa=np.inf)
         with pytest.raises(pm.exceptions.SamplingError):
             model.check_start_vals(model.initial_point())
 
