@@ -45,7 +45,11 @@ from scipy import stats
 
 # the distributions to be tested
 from pymc_extras.distributions import Chi, ExtGenPareto, GenExtreme, GenPareto, Maxwell
-from pymc_extras.distributions.continuous import ext_gen_pareto_logp, gen_pareto_logp
+from pymc_extras.distributions.continuous import (
+    _ExtGenParetoPIT,
+    ext_gen_pareto_logp,
+    gen_pareto_logp,
+)
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:Numba will use object mode to run Generalized Extreme Value:UserWarning"
@@ -1124,6 +1128,23 @@ class TestGenParetoTransforms:
                 logistic = -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y)
                 np.testing.assert_allclose(lp, logistic, atol=1e-2)
 
+    def test_excess_from_y_upper_tail_is_finite_under_float32(self):
+        # The bulk/tail crossover must track the dtype's exponent range: with a
+        # hard-coded float64 cutoff (700), float32 y in ~[88, 700) routes through the
+        # bulk branch where log F_ext has already underflowed, so the excess (and the
+        # transformed logp) blow up to +inf well inside the reachable range.
+        y = pt.scalar("y", dtype="float32")
+        excess = _ExtGenParetoPIT._excess_from_y(
+            y, np.float32(0.0), np.float32(1.0), np.float32(0.3), np.float32(2.0)
+        )
+        assert excess.dtype == "float32"
+        fn = pytensor.function([y], excess)
+        for yi in (90.0, 200.0, 700.0, 5000.0):
+            m = float(fn(np.float32(yi)))
+            assert np.isfinite(m)
+            # m ~ y + log(kappa) far out in the tail (S_F ~ S_ext / kappa).
+            np.testing.assert_allclose(m, yi + np.log(2.0), rtol=1e-3)
+
     @pytest.mark.parametrize(
         "kappa, ys",
         [
@@ -1205,10 +1226,14 @@ class TestGenParetoTransforms:
     def test_latent_sampling_stays_in_support(self, xi, mu, sigma):
         with pm.Model() as model:
             GenPareto("x", mu=mu, sigma=sigma, xi=xi)
+            # Keep this real-NUTS check cheap and deterministic for CI: a fixed seed
+            # plus cores=1 (no per-chain process spawn); the clean PIT geometry needs
+            # only a short run to stay in support with zero divergences.
             idata = pm.sample(
-                200,
-                tune=300,
+                100,
+                tune=200,
                 chains=2,
+                cores=1,
                 progressbar=False,
                 random_seed=1,
                 compute_convergence_checks=False,

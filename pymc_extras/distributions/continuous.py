@@ -1322,25 +1322,34 @@ class _ExtGenParetoPIT(_GPDProbabilityIntegralTransform):
     def _excess_from_y(value, mu, sigma, xi, kappa):
         # m = -log(S_F), the GPD-survival exponent, recovered from y = logit(F_ext).
         #
-        # Bulk (value < 700): m = -log(1 - F_ext ** (1/kappa)) from log F_ext =
+        # Bulk (value < cutoff): m = -log(1 - F_ext ** (1/kappa)) from log F_ext =
         # -softplus(-y), via the shared log1mexp inverse so a tiny GPD survival (the
         # small-kappa regime) is not rounded away to 0. Exact, so it round-trips for
         # every kappa down to where the carrier underflows (see the class docstring's
         # kappa note).
         #
-        # Tail (value >= 700): log F_ext = -softplus(-y) rounds to 0 near y ~ 745,
-        # sending m -> inf though the quantile is finite. There S_ext = exp(-t) is
-        # tiny (t = softplus(y)) and S_F ~ S_ext / kappa, so
+        # Tail (value >= cutoff): log F_ext = -softplus(-y) rounds to 0 once exp(-y)
+        # underflows, sending m -> inf though the quantile is finite. There
+        # S_ext = exp(-t) is tiny (t = softplus(y)) and S_F ~ S_ext / kappa, so
         #   m -> t + log(kappa) - log(_log1p_div(-exp(-t))),
         # built without forming exp(-y) before a log, finite until t overflows. The
         # two branches agree to machine precision at the switch, and both run on
         # clamped inputs so the discarded one (and its gradient) stays finite.
+        #
+        # The crossover is where exp(-y) underflows, which tracks the dtype's exponent
+        # range (~700 for float64, ~80 for float32) -- derive it from finfo rather than
+        # hard-coding 700, which under float32 would route y in ~[80, 700) through the
+        # bulk branch where log F_ext has already underflowed (m -> +inf). float64 is
+        # unchanged: min(700, 708.4 - 8) = 700.
+        cutoff = np.asarray(
+            min(700.0, float(-np.log(np.finfo(value.dtype).tiny)) - 8.0), dtype=value.dtype
+        )
         t = pt.softplus(value)
-        log_F = -pt.softplus(-pt.minimum(value, 700.0))
+        log_F = -pt.softplus(-pt.minimum(value, cutoff))
         m_bulk = _ext_gpd_excess_from_log_prob(log_F, kappa)
-        s = pt.exp(-pt.maximum(t, 700.0))
+        s = pt.exp(-pt.maximum(t, cutoff))
         m_tail = t + pt.log(kappa) - pt.log(_log1p_div(-s))
-        return pt.switch(value < 700.0, m_bulk, m_tail)
+        return pt.switch(value < cutoff, m_bulk, m_tail)
 
     @staticmethod
     def _quantile_from_excess(excess, mu, sigma, xi, kappa):
