@@ -649,6 +649,21 @@ class TestGenParetoBoundaries:
                 assert np.isnan(pm.logcdf(dist, x).eval())
                 assert np.isnan(pm.logccdf(dist, x).eval())
 
+    def test_nonfinite_kappa_propagates_consistently(self):
+        # ``kappa = inf`` passes the ``kappa > 0`` check (inf > 0 is True), so the
+        # check does not catch it; like a non-finite ``xi`` it must then propagate
+        # ``nan`` uniformly across logp / logcdf / logccdf / icdf, not leak the
+        # inconsistent nan / -inf / 0 the un-guarded branches would.
+        dist = ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.3, kappa=np.inf)
+        for x in (1.0, 0.0, -1.0):
+            assert np.isnan(pm.logp(dist, x).eval())
+            assert np.isnan(pm.logcdf(dist, x).eval())
+            assert np.isnan(pm.logccdf(dist, x).eval())
+        assert np.isnan(pm.icdf(dist, 0.5).eval())
+        # ``kappa = nan`` fails ``kappa > 0`` (nan > 0 is False) and raises instead.
+        with pytest.raises(ParameterValueError):
+            pm.logp(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.3, kappa=np.nan), 1.0).eval()
+
 
 class TestGenParetoHeavyTail:
     """Heavy-tail (xi > 1) coverage with *relative* tolerance.
@@ -1004,6 +1019,38 @@ class TestGenParetoTransforms:
         fn = pytensor.function([model.value_vars[0]], model.logp(sum=True), mode=fast)
         for y in (-10.0, 0.0, 10.0):
             assert float(fn(y)) == -np.inf
+
+    def test_transform_is_a_saturated_readout_when_the_quantile_collapses(self):
+        # Honest contract in the collapse regime (here small kappa, so the ExtGPD
+        # median is sub-ULP from mu): this is NOT a bijection. The transformed
+        # DENSITY the sampler targets is the correct Logistic(y), but the recovered
+        # latent x is a quantized readout pinned at the boundary, so
+        # forward(backward(y)) != y -- log_jac_det is the exact-PIT density
+        # correction, not the Jacobian of the saturated backward. (y = 0 is the
+        # median, well inside the central prior mass, not a cosmic tail.)
+        mu = 2.0
+        with pm.Model() as model:
+            x = ExtGenPareto("x", mu=mu, sigma=1.0, xi=0.0, kappa=0.01)
+        yv = model.value_vars[0]
+        tr = model.rvs_to_transforms[x]
+        inputs = x.owner.inputs
+        logp = pytensor.function([yv], model.logp(sum=True))
+        backward = pytensor.function([yv], tr.backward(yv, *inputs))
+        roundtrip = pytensor.function([yv], tr.forward(tr.backward(yv, *inputs), *inputs))
+        ys = (-10.0, 0.0)
+        for y in ys:
+            # the transformed density is still the correct Logistic ...
+            np.testing.assert_allclose(
+                float(logp(y)), -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y), atol=1e-2
+            )
+            # ... but the latent readout is saturated onto mu.
+            assert abs(float(backward(y)) - mu) < 1e-12
+        # Both y collapse to the *same* x, so forward(backward(.)) is a single constant
+        # independent of y -- i.e. the map is deliberately not invertible here.
+        rts = [float(roundtrip(y)) for y in ys]
+        assert abs(rts[0] - rts[1]) < 1e-12  # collapsed to one readout
+        for y, rt in zip(ys, rts):
+            assert abs(rt - y) > 1e-3  # forward(backward(y)) != y
 
     def test_transform_finite_under_float32(self):
         # dtype-aware floor: the small-kappa lower-tail collapse must not NaN under

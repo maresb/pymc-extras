@@ -507,18 +507,23 @@ def _in_gpd_support(z, t):
     return pt.and_(z >= 0, 1 + t > 0)
 
 
-def _propagate_nonfinite_shape(result, xi):
-    """Map ``result`` to ``nan`` wherever the shape ``xi`` is non-finite.
+def _propagate_nonfinite_shape(result, xi, kappa=None):
+    """Map ``result`` to ``nan`` wherever a shape parameter is non-finite.
 
     The support / boundary ``switch`` masks below mask out-of-support values to
     ``-inf`` / ``0``; without this a non-finite shape would be silently turned
     into one of those ("valid parameter, impossible value", which is a lie).
     Keyed on ``isfinite(xi)`` directly -- not on ``1 + xi z`` -- so it fires for
     ``xi = nan`` and ``xi = +-inf`` at *every* value, including ``x = mu`` (where
-    ``z = 0`` makes ``1 + xi z`` finite). ``nan``/``inf`` shape in -> ``nan``
-    out, consistently across logp / logcdf / logccdf.
+    ``z = 0`` makes ``1 + xi z`` finite). ``nan``/``inf`` shape in -> ``nan`` out,
+    consistently across logp / logcdf / logccdf. For the extended family ``kappa``
+    is checked the same way (a non-finite ``kappa`` passes ``kappa > 0`` but would
+    otherwise leak inconsistent ``nan`` / ``-inf`` / ``0`` across the three).
     """
-    return pt.switch(pt.isfinite(xi), result, np.nan)
+    result = pt.switch(pt.isfinite(xi), result, np.nan)
+    if kappa is not None:
+        result = pt.switch(pt.isfinite(kappa), result, np.nan)
+    return result
 
 
 # The ``gen_pareto_*`` / ``ext_gen_pareto_*`` builders below are pure PyTensor:
@@ -601,7 +606,7 @@ def ext_gen_pareto_logp(value, mu, sigma, xi, kappa):
     logp = pt.log(kappa) + carrier + _gpd_log_h(z, sigma, t, log_s)
     logp = pt.switch(_in_gpd_support(z, t), logp, -np.inf)
     logp = pt.switch(pt.eq(z, np.inf), -np.inf, logp)
-    return _propagate_nonfinite_shape(logp, xi)
+    return _propagate_nonfinite_shape(logp, xi, kappa)
 
 
 def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
@@ -612,7 +617,7 @@ def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
     logcdf = pt.switch(above_upper, 0.0, kappa * _gpd_log_H(z, t))
     logcdf = pt.switch(z >= 0, logcdf, -np.inf)
     logcdf = pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
-    return _propagate_nonfinite_shape(logcdf, xi)
+    return _propagate_nonfinite_shape(logcdf, xi, kappa)
 
 
 def ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa):
@@ -662,7 +667,7 @@ def ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa):
     above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + t, 0))
     logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
     logsf = pt.switch(z < 0, 0.0, logsf)
-    return _propagate_nonfinite_shape(logsf, xi)
+    return _propagate_nonfinite_shape(logsf, xi, kappa)
 
 
 def _ext_gpd_excess_from_log_prob(log_q, kappa):
@@ -1150,6 +1155,25 @@ class _GPDProbabilityIntegralTransform(Transform):
     the GPD excess ``m = -log(survival)`` directly from ``y`` (``softplus(y)``
     for the base family), and ``log_jac_det`` uses the analytic
     ``log F + log S - logp(x)`` rather than autodiffing the quantile graph.
+
+    Bijectivity and the saturated readout. Where the quantile is representable this
+    is an ordinary bijective PIT: ``forward`` and ``backward`` are inverse and
+    ``log_jac_det`` is the true ``log|dx/dy|``. But the quantile is *not* always
+    representable -- the ExtGPD median is sub-ULP from ``mu`` for small ``kappa``,
+    and the heavy/bounded upper tail overflows -- so ``backward`` deliberately
+    *saturates* ``x`` onto the support endpoint there (a ``pt.maximum`` floor at the
+    bottom, overflow / the wall at the top). In that regime the map is no longer
+    invertible: ``forward(backward(y)) != y``, and the saturated ``backward`` has
+    derivative ``0`` (true ``log|dx/dy| = -inf``). ``log_jac_det`` is then *not* the
+    Jacobian of the saturated readout; it is the density correction
+    ``log F + log S - logp(x)`` of the *exact* PIT, so the transformed *density* the
+    sampler targets stays the correct Logistic, while the recovered latent ``x`` is
+    a quantized readout pinned at the boundary. This is the only consistent float64
+    behaviour for a latent whose distribution is (numerically) a point mass at the
+    boundary -- which is exactly what small ``kappa`` / the deep tail means -- but
+    it does mean this is a density-correct reparameterization with a saturated
+    readout there, not a bijection. (Observed data never uses the transform; this
+    affects only a latent variable sampled in that degenerate regime.)
 
     Range of validity. ``log_jac_det`` computes the Jacobian as ``-softplus(y) -
     softplus(-y) - logp(backward(y))`` (the first two terms are ``log F + log S``,
