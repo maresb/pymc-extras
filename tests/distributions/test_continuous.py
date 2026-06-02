@@ -715,9 +715,9 @@ class TestGenParetoHeavyTail:
         # kappa * S (not just the GPD survival), or large kappa makes
         # log(kappa) + (-x) positive. xi = 0 -> survival = 1 - (1 - e^-x)^kappa;
         # the exact tail value is log(kappa) - x when kappa * e^-x << 1. The huge
-        # kappa cases (>= 1e155) guard the tail series: forming (kappa-1)(kappa-2)
-        # overflows float64 (~1e310) and times an underflowed S^2 gives NaN, so the
-        # series keeps only the first-order, single-kappa-factor term.
+        # kappa cases (>= 1e155) guard the tail series: the kappa^k coefficients
+        # (e.g. (kappa-1)(kappa-2)) would overflow float64 (~1e310) and multiply an
+        # underflowed S^2 -> NaN, so the series is written in r = kappa*S and s = S.
         x = np.array([40.0, 100.0, 1000.0])
         got = pm.logccdf(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.0, kappa=kappa), x).eval()
         assert np.all(got <= 0.0)
@@ -984,6 +984,40 @@ class TestGenParetoTransforms:
                 assert not np.isnan(lp), (builder.__name__, kw, y)
                 logistic = -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y)
                 np.testing.assert_allclose(lp, logistic, atol=1e-3)
+
+    def test_transform_saturation_and_degenerate_are_minus_inf_not_nan(self):
+        # Outside the representable range the transformed logp must be -inf (a clean
+        # reject) -- never NaN, and never a silent wrong finite value. FAST_COMPILE,
+        # so it cannot lean on the optimizer cancelling logp(backward).
+        fast = pytensor.compile.mode.Mode(linker="py", optimizer="fast_compile")
+        # Unreachable upper saturation: heavy tail (quantile overflows) and the
+        # bounded xi < 0 wall.
+        for kw, y in [({"xi": 5.0}, 150.0), ({"xi": -0.5}, 80.0)]:
+            with pm.Model() as model:
+                GenPareto("x", mu=0.0, sigma=1.0, **kw)
+            fn = pytensor.function([model.value_vars[0]], model.logp(sum=True), mode=fast)
+            assert float(fn(y)) == -np.inf
+        # Degenerate near-delta sigma << ulp(mu): the floor lifts x to z ~ 1/ulp, so
+        # the residue is unrecoverable -- yields -inf, not a wrong finite value.
+        with pm.Model() as model:
+            ExtGenPareto("x", mu=1.0, sigma=1e-100, xi=0.0, kappa=1e-300)
+        fn = pytensor.function([model.value_vars[0]], model.logp(sum=True), mode=fast)
+        for y in (-10.0, 0.0, 10.0):
+            assert float(fn(y)) == -np.inf
+
+    def test_transform_finite_under_float32(self):
+        # dtype-aware floor: the small-kappa lower-tail collapse must not NaN under
+        # float32, where a literal 1e-300 floor underflows to 0 (leaving logp = +inf).
+        fast = pytensor.compile.mode.Mode(linker="py", optimizer="fast_compile")
+        with pytensor.config.change_flags(floatX="float32"):
+            with pm.Model() as model:
+                ExtGenPareto("x", mu=0.0, sigma=1.0, xi=0.0, kappa=1e-20)
+            fn = pytensor.function([model.value_vars[0]], model.logp(sum=True), mode=fast)
+            for y in (-10.0, 0.0, 10.0):
+                lp = float(fn(np.float32(y)))
+                assert not np.isnan(lp)
+                logistic = -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y)
+                np.testing.assert_allclose(lp, logistic, atol=1e-2)
 
     @pytest.mark.parametrize(
         "kappa, ys",
