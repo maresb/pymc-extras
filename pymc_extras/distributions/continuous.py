@@ -702,11 +702,6 @@ def ext_gen_pareto_icdf(value, mu, sigma, xi, kappa):
     return _propagate_nonfinite_shape(x, xi, kappa)
 
 
-def _uniform_draw(size, rng):
-    """``(next_rng, draw)`` from a uniform RV (the pytensor random idiom)."""
-    return uniform(size=size, rng=rng, return_next_rng=True)
-
-
 class GenParetoRV(SymbolicRandomVariable):
     name = "genpareto"
     extended_signature = "[rng],[size],(),(),()->[rng],()"
@@ -723,7 +718,7 @@ class GenParetoRV(SymbolicRandomVariable):
             size = implicit_size_from_params(mu, sigma, xi, ndims_params=cls.ndims_params)
         # Draw the survival probability directly so excess = -log(v) avoids the
         # 1 - u cancellation that hurts the heavy upper tail.
-        next_rng, v = _uniform_draw(size, rng)
+        next_rng, v = uniform(size=size, rng=rng, return_next_rng=True)
         draws = _gpd_quantile_from_excess(-pt.log(v), mu, sigma, xi)
         return cls(inputs=[rng, size, mu, sigma, xi], outputs=[next_rng, draws])(
             rng, size, mu, sigma, xi
@@ -745,7 +740,7 @@ class ExtGenParetoRV(SymbolicRandomVariable):
         size = normalize_size_param(size)
         if rv_size_is_none(size):
             size = implicit_size_from_params(mu, sigma, xi, kappa, ndims_params=cls.ndims_params)
-        next_rng, u = _uniform_draw(size, rng)
+        next_rng, u = uniform(size=size, rng=rng, return_next_rng=True)
         # Carrier draw u = F; excess = -log(1 - u ** (1/kappa)), via log1mexp so
         # small-kappa draws do not collapse to the lower endpoint (1 - u**.. -> 1).
         excess = _ext_gpd_excess_from_log_prob(pt.log(u), kappa)
