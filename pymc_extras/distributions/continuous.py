@@ -831,15 +831,46 @@ class GenPareto(Continuous):
 
     Examples
     --------
+    Fitting exceedances over a known threshold. The observations must lie inside
+    the support :math:`[\mu,\ \mu - \sigma/\xi]`; for :math:`\xi < 0` the binding
+    constraint is the upper wall, ``max(data) < mu - sigma/xi``, which rearranges to
+    a *lower* bound on the shape, ``xi > -sigma / (max(data) - mu)`` (there is no
+    upper bound -- :math:`\xi \geq 0` is an unbounded tail that always contains the
+    data). Encoding that as the lower bound of an otherwise broad prior on
+    :math:`\xi` lets NUTS sample the whole shape range -- bounded and unbounded
+    tails alike -- without the support-wall divergences a free ``(sigma, xi)`` pair
+    suffers: the transform stretches the wall to infinity in the unconstrained
+    space. (Naming the GPD parameters ``pareto_*`` keeps them distinct from the
+    ``mu`` / ``sigma`` *of the prior distributions*.)
+
     .. code-block:: python
 
         import pymc as pm
         from pymc_extras.distributions import GenPareto
 
+        xmin, xmax = data.min(), data.max()
+        pareto_mu = threshold  # known peaks-over-threshold value (fixed)
+        assert pareto_mu <= xmin  # every observation lies at/above it
+
         with pm.Model():
-            sigma = pm.HalfNormal("sigma", 1.0)
-            xi = pm.Normal("xi", 0.0, 0.5)
-            obs = GenPareto("obs", mu=0.0, sigma=sigma, xi=xi, observed=exceedances)
+            pareto_sigma = pm.Exponential("pareto_sigma", 1.0)
+            # data in support  <=>  xi > -sigma / (xmax - mu); no upper bound.
+            pareto_xi = pm.TruncatedNormal(
+                "pareto_xi",
+                mu=0.0,
+                sigma=2.0,
+                lower=-pareto_sigma / (xmax - pareto_mu),
+            )
+            GenPareto("obs", mu=pareto_mu, sigma=pareto_sigma, xi=pareto_xi, observed=data)
+            idata = pm.sample()
+
+    The lower bound depends on ``xmax``, so the prior support encodes the hard
+    "data fall inside the support" requirement -- the standard way to handle a
+    distribution whose support edge is an unknown the data constrain (cf.
+    ``theta >= max(data)`` for ``Uniform(0, theta)``). This addresses *sampling
+    stability*; it is distinct from the deeper float64 precision limit right at the
+    wall noted above (reached only when the wall is pinned within ``~1e-13`` of the
+    data).
     """
 
     rv_type = GenParetoRV
@@ -979,16 +1010,39 @@ class ExtGenPareto(Continuous):
 
     Examples
     --------
+    The upper tail is the GPD tail, so fit it the same way: bound :math:`\xi`
+    below by ``-sigma / (max(data) - mu)`` to keep the data inside the support and
+    sample without support-wall divergences (see :class:`GenPareto` Examples for
+    why). ``kappa`` only reshapes the lower tail and takes an ordinary positive
+    prior.
+
     .. code-block:: python
 
         import pymc as pm
         from pymc_extras.distributions import ExtGenPareto
 
+        xmin, xmax = data.min(), data.max()
+        pareto_mu = threshold
+        assert pareto_mu <= xmin
+
         with pm.Model():
-            sigma = pm.HalfNormal("sigma", 1.0)
-            xi = pm.Normal("xi", 0.0, 0.5)
-            kappa = pm.HalfNormal("kappa", 2.0)
-            obs = ExtGenPareto("obs", mu=0.0, sigma=sigma, xi=xi, kappa=kappa, observed=data)
+            pareto_sigma = pm.Exponential("pareto_sigma", 1.0)
+            pareto_kappa = pm.Exponential("pareto_kappa", 1.0)
+            pareto_xi = pm.TruncatedNormal(
+                "pareto_xi",
+                mu=0.0,
+                sigma=2.0,
+                lower=-pareto_sigma / (xmax - pareto_mu),
+            )
+            ExtGenPareto(
+                "obs",
+                mu=pareto_mu,
+                sigma=pareto_sigma,
+                xi=pareto_xi,
+                kappa=pareto_kappa,
+                observed=data,
+            )
+            idata = pm.sample()
     """
 
     rv_type = ExtGenParetoRV
