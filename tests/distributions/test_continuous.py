@@ -882,7 +882,11 @@ class TestGenParetoTransforms:
             builder("x", **dist_kwargs)
         y = model.value_vars[0]
         logp = pytensor.function([y], model.logp(sum=True))
-        ys = np.linspace(-30, 30, 30001)
+        # The integrand is the (smooth, exactly-Logistic) transformed density, so the
+        # error is dominated by the +-30 tail truncation (~2e-13), not the grid
+        # spacing: 2001 points already integrate to ~1e-13, far inside the tolerance,
+        # without evaluating the compiled function tens of thousands of times.
+        ys = np.linspace(-30, 30, 2001)
         density = np.exp(np.array([float(logp(yi)) for yi in ys]))
         np.testing.assert_allclose(trapezoid(density, ys), 1.0, atol=1e-3)
 
