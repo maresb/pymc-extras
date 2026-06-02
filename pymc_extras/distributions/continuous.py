@@ -586,7 +586,10 @@ def gen_pareto_icdf(value, mu, sigma, xi):
     # Explicit endpoints: q=1 -> finite upper bound (xi<0) or +inf, q=0 -> mu.
     # Without this, q=1 with xi<0 is ``inf * 0 = nan`` rather than ``mu - sigma/xi``.
     x = pt.switch(pt.eq(value, 1), _gpd_upper_bound(mu, sigma, xi), x)
-    return pt.switch(pt.eq(value, 0), mu, x)
+    x = pt.switch(pt.eq(value, 0), mu, x)
+    # The endpoint switches above would otherwise hand back mu / the upper bound even
+    # for a non-finite xi; propagate NaN so q = 0 / 1 agree with the interior.
+    return _propagate_nonfinite_shape(x, xi)
 
 
 # Extended Generalized Pareto core. Naveau et al. (2016) extended GPD with
@@ -693,7 +696,10 @@ def ext_gen_pareto_icdf(value, mu, sigma, xi, kappa):
     excess = _ext_gpd_excess_from_log_prob(pt.log(value), kappa)
     x = _gpd_quantile_from_excess(excess, mu, sigma, xi)
     x = pt.switch(pt.eq(value, 1), _gpd_upper_bound(mu, sigma, xi), x)
-    return pt.switch(pt.eq(value, 0), mu, x)
+    x = pt.switch(pt.eq(value, 0), mu, x)
+    # As in the GPD quantile: the q = 0 / 1 endpoints must also propagate a non-finite
+    # shape (xi or kappa) as NaN rather than returning mu / the upper bound.
+    return _propagate_nonfinite_shape(x, xi, kappa)
 
 
 def _uniform_draw(size, rng):
@@ -1204,6 +1210,16 @@ class _GPDProbabilityIntegralTransform(Transform):
       meaningful; it yields ``-inf`` (a clean reject) rather than a silent wrong
       value.
 
+    Invalid parameters do not slip through as a valid latent. A non-finite shape
+    (``xi`` or ``kappa``) makes ``logp(x)`` NaN; ``log_jac_det`` returns that NaN
+    through a constant switch branch so the ``logistic - logp(x)`` cancellation
+    cannot turn it back into a finite Logistic, and the transformed logp stays NaN
+    (PyMC's ``check_start_vals`` then rejects it loudly) -- matching ``pm.Gamma`` /
+    ``pm.StudentT`` for a non-finite shape. A non-finite scale (``sigma = inf``) is
+    the degenerate infinite-scale limit and yields ``-inf`` (a clean reject), as
+    ``pm.Normal`` does; ``sigma`` / ``kappa <= 0`` and ``sigma`` / ``kappa = nan``
+    are caught by the wrappers' ``check_parameters``.
+
     The default starting point is interior and finite-logp: ``support_point``
     returns the median, or the underlying GPD median when the ExtGPD median rounds
     onto ``mu`` (the sole exception being the general representability limit where
@@ -1271,7 +1287,15 @@ class _GPDProbabilityIntegralTransform(Transform):
         logistic = -pt.softplus(value) - pt.softplus(-value)
         logp_x = self._logp(x, *params)
         unrepresentable = pt.abs(logp_x) > 1.0 / np.sqrt(finfo.eps)
-        return pt.switch(unrepresentable, -np.inf, logistic - logp_x)
+        jac = pt.switch(unrepresentable, -np.inf, logistic - logp_x)
+        # A non-finite shape (xi or kappa) makes logp_x NaN. Returning logistic -
+        # logp_x would let that NaN cancel against the framework's + logp(backward) and
+        # resurface as a *finite* Logistic, silently accepting an invalid parameter as a
+        # valid latent. Route it through a switch whose other branch is a bare constant
+        # (no logp_x to cancel), so the transformed logp stays NaN -- matching pm.Gamma
+        # / pm.StudentT, whose transformed latent logp is NaN (caught loudly at
+        # initialization) for a non-finite shape rather than a spurious finite density.
+        return pt.switch(pt.isnan(logp_x), np.nan, jac)
 
 
 class _GenParetoPIT(_GPDProbabilityIntegralTransform):

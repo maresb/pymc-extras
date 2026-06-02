@@ -648,18 +648,24 @@ class TestGenParetoBoundaries:
                 assert np.isnan(pm.logp(dist, x).eval())
                 assert np.isnan(pm.logcdf(dist, x).eval())
                 assert np.isnan(pm.logccdf(dist, x).eval())
+            # icdf too, INCLUDING the q = 0 / 1 endpoints (which otherwise hand back
+            # mu / the upper bound regardless of the invalid shape).
+            for q in (0.0, 0.5, 1.0):
+                assert np.isnan(pm.icdf(dist, q).eval())
 
     def test_nonfinite_kappa_propagates_consistently(self):
         # ``kappa = inf`` passes the ``kappa > 0`` check (inf > 0 is True), so the
-        # check does not catch it; like a non-finite ``xi`` it must then propagate
-        # ``nan`` uniformly across logp / logcdf / logccdf / icdf, not leak the
-        # inconsistent nan / -inf / 0 the un-guarded branches would.
+        # check does not catch it; like a non-finite ``xi`` (and like pm.Gamma's
+        # ``alpha = inf``) it must then propagate ``nan`` uniformly across logp /
+        # logcdf / logccdf / icdf -- including the icdf endpoints -- not leak the
+        # inconsistent nan / -inf / 0 / bound the un-guarded branches would.
         dist = ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.3, kappa=np.inf)
         for x in (1.0, 0.0, -1.0):
             assert np.isnan(pm.logp(dist, x).eval())
             assert np.isnan(pm.logcdf(dist, x).eval())
             assert np.isnan(pm.logccdf(dist, x).eval())
-        assert np.isnan(pm.icdf(dist, 0.5).eval())
+        for q in (0.0, 0.5, 1.0):
+            assert np.isnan(pm.icdf(dist, q).eval())
         # ``kappa = nan`` fails ``kappa > 0`` (nan > 0 is False) and raises instead.
         with pytest.raises(ParameterValueError):
             pm.logp(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.3, kappa=np.nan), 1.0).eval()
@@ -1051,6 +1057,51 @@ class TestGenParetoTransforms:
         assert abs(rts[0] - rts[1]) < 1e-12  # collapsed to one readout
         for y, rt in zip(ys, rts):
             assert abs(rt - y) > 1e-3  # forward(backward(y)) != y
+
+    @pytest.mark.parametrize(
+        "kw",
+        [
+            {"xi": np.inf, "kappa": 1.0},
+            {"xi": -np.inf, "kappa": 1.0},
+            {"xi": 0.0, "kappa": np.inf},
+            {"xi": np.inf},  # GenPareto (no kappa)
+        ],
+    )
+    def test_nonfinite_shape_does_not_leak_a_finite_logistic_through_the_transform(self, kw):
+        # Blocker regression: the log_jac_det = logistic - logp(x) cancellation must
+        # NOT let a non-finite shape (xi / kappa) cancel its NaN raw logp out of the
+        # graph and resurface as a *finite* Logistic in transformed space -- that would
+        # silently accept an invalid parameter as a valid latent. The transformed logp
+        # must be non-finite (NaN), so PyMC's check_start_vals rejects it loudly,
+        # exactly as pm.Gamma(alpha=inf) does.
+        cls = ExtGenPareto if "kappa" in kw else GenPareto
+        with pm.Model() as model:
+            cls("x", mu=0.0, sigma=1.0, **kw)
+        logp = pytensor.function(
+            [model.value_vars[0]], model.logp(sum=True), on_unused_input="ignore"
+        )
+        for y in (-3.0, 0.0, 3.0):
+            assert not np.isfinite(float(logp(y)))  # NaN, never a spurious finite value
+        # ... and the model-level loud guard fires (the practical symptom of the bug).
+        with pytest.raises(pm.exceptions.SamplingError):
+            model.check_start_vals(model.initial_point())
+
+    def test_infinite_scale_is_a_clean_reject_like_normal(self):
+        # sigma = inf is the degenerate infinite-scale limit. PyMC's own scale
+        # convention (verified: pm.Normal(0, inf).logp = -inf, not NaN, not raised)
+        # treats it as a -inf reject rather than an invalid parameter -- the shape /
+        # scale asymmetry (shape inf -> NaN like Gamma; scale inf -> -inf like Normal)
+        # is PyMC's, not ours. The key point is it is a clean reject in transformed
+        # space, NOT a spurious finite Logistic.
+        assert float(pm.logp(pm.Normal.dist(0.0, np.inf), 0.0).eval()) == -np.inf  # the precedent
+        for cls, kw in [(GenPareto, {"xi": 0.0}), (ExtGenPareto, {"xi": 0.0, "kappa": 1.0})]:
+            assert float(pm.logp(cls.dist(mu=0.0, sigma=np.inf, **kw), 1.0).eval()) == -np.inf
+            with pm.Model() as model:
+                cls("x", mu=0.0, sigma=np.inf, **kw)
+            logp = pytensor.function(
+                [model.value_vars[0]], model.logp(sum=True), on_unused_input="ignore"
+            )
+            assert float(logp(0.0)) == -np.inf  # transformed: clean reject, not finite
 
     def test_transform_finite_under_float32(self):
         # dtype-aware floor: the small-kappa lower-tail collapse must not NaN under
