@@ -1013,8 +1013,10 @@ class ExtGenPareto(Continuous):
     The upper tail is the GPD tail, so fit it the same way: bound :math:`\xi`
     below by ``-sigma / (max(data) - mu)`` to keep the data inside the support and
     sample without support-wall divergences (see :class:`GenPareto` Examples for
-    why). ``kappa`` only reshapes the lower tail and takes an ordinary positive
-    prior.
+    why). ``kappa`` only reshapes the lower tail; a ``Gamma(2, 1)`` prior (density
+    ``-> 0`` at the origin, mode at 1) keeps it off the degenerate ``kappa -> 0``
+    limit, where the distribution collapses toward a point mass and ``sigma`` can
+    run away to compensate.
 
     .. code-block:: python
 
@@ -1027,7 +1029,7 @@ class ExtGenPareto(Continuous):
 
         with pm.Model():
             pareto_sigma = pm.Exponential("pareto_sigma", 1.0)
-            pareto_kappa = pm.Exponential("pareto_kappa", 1.0)
+            pareto_kappa = pm.Gamma("pareto_kappa", alpha=2, beta=1)
             pareto_xi = pm.TruncatedNormal(
                 "pareto_xi",
                 mu=0.0,
