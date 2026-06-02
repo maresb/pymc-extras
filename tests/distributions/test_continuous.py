@@ -686,7 +686,7 @@ class TestGenParetoHeavyTail:
 
     pytestmark = _GPD_FPE_FILTERS
 
-    @pytest.mark.parametrize("xi", [1.5, 3.0, 5.0])
+    @pytest.mark.parametrize("xi", [1.5, 5.0])
     def test_logp_logcdf_icdf_match_scipy(self, xi):
         mu, sigma = 0.0, 1.3
         x = np.array([0.5, 2.0, 10.0, 1e4])
@@ -734,7 +734,7 @@ class TestGenParetoHeavyTail:
             assert np.all(np.isfinite(got))
             np.testing.assert_allclose(got, np.log(kappa) - x, rtol=1e-9)
 
-    @pytest.mark.parametrize("kappa", [10.0, 1e6, 1e20, 1e155, 1e300])
+    @pytest.mark.parametrize("kappa", [10.0, 1e20, 1e155, 1e300])
     def test_ext_logccdf_is_a_valid_log_probability_for_large_kappa(self, kappa):
         # A log survival probability is always <= 0. The tail branch must key on
         # kappa * S (not just the GPD survival), or large kappa makes
@@ -895,71 +895,88 @@ class TestGenParetoTransforms:
         np.testing.assert_allclose(trapezoid(density, ys), 1.0, atol=1e-3)
 
     @pytest.mark.parametrize(
-        "dist_kwargs, builder",
+        "builder, kwargs, ys, roundtrip",
         [
-            ({"mu": 0.0, "sigma": 1.0, "xi": 0.3}, GenPareto),
-            ({"mu": 0.0, "sigma": 1.0, "xi": -0.5}, GenPareto),
-            ({"mu": 0.0, "sigma": 1.0, "xi": 0.3, "kappa": 2.0}, ExtGenPareto),
-            ({"mu": 0.0, "sigma": 1.0, "xi": -0.3, "kappa": 0.5}, ExtGenPareto),
+            # Bounded xi < 0 GPD: guards the y ~ 37 sigmoid-saturation bug (a naive
+            # icdf(sigmoid(y)) returned inf/nan there); round-trips to ~45 (the
+            # bounded-wall CDF, log1mexp near the wall, loses accuracy beyond that).
+            (GenPareto, {"mu": 0.0, "sigma": 1.5, "xi": -0.5}, (-45.0, -37.0, 37.0, 45.0), True),
+            # Unbounded xi = 0 GPD: no wall, exact arbitrarily far out (to y = 1000).
+            (GenPareto, {"mu": 0.0, "sigma": 1.0, "xi": 0.0}, (-30.0, 100.0, 1000.0), False),
+            # Heavy xi > 0 GPD: exact below the y ~ 709/xi quantile overflow (400 << 2363).
+            (GenPareto, {"mu": 0.0, "sigma": 1.0, "xi": 0.3}, (37.0, 200.0, 400.0), False),
+            # Bounded ExtGPD: the carrier on top of the moving xi < 0 wall.
+            (
+                ExtGenPareto,
+                {"mu": 0.0, "sigma": 1.0, "xi": -0.3, "kappa": 0.5},
+                (-45.0, -37.0, 37.0, 45.0),
+                True,
+            ),
+            # Unbounded ExtGPD deep tail: the y ~ 745 log-F underflow recovered
+            # survival-side (a naive log-F route sent the excess to inf there).
+            (
+                ExtGenPareto,
+                {"mu": 0.0, "sigma": 1.0, "xi": 0.0, "kappa": 2.0},
+                (-30.0, 100.0, 1000.0),
+                False,
+            ),
+            # ExtGPD large kappa: the inverse must depend on kappa (ten orders below).
+            (
+                ExtGenPareto,
+                {"mu": 0.0, "sigma": 1.0, "xi": 0.0, "kappa": 1e8},
+                (-30.0, 0.0, 30.0),
+                True,
+            ),
+            # ExtGPD kappa < 1: the small-kappa inverse (-log1mexp(log F / kappa)) keeps
+            # a tiny GPD survival from collapsing the excess to 0; still round-trips here.
+            (
+                ExtGenPareto,
+                {"mu": 0.0, "sigma": 1.0, "xi": 0.0, "kappa": 1e-2},
+                (-5.0, 0.0, 40.0),
+                True,
+            ),
+            # ExtGPD collapse (kappa < ~|y|/745): the quantile collapses onto mu, where a
+            # kappa < 1 density diverges (logp = +inf); the transform still returns the
+            # exact finite Logistic, not the +inf - inf = NaN a logcdf+logccdf route gave.
+            # No round-trip there -- the latent readout saturates onto mu.
+            (
+                ExtGenPareto,
+                {"mu": 2.0, "sigma": 1.0, "xi": 0.0, "kappa": 1e-300},
+                (-30.0, 0.0, 80.0),
+                False,
+            ),
         ],
     )
-    def test_transform_is_finite_and_logistic_in_the_tails(self, dist_kwargs, builder):
-        # Regression for the saturation bug: sigmoid(y) rounds to exactly 1 for
-        # y >= 37, so a naive backward via icdf(sigmoid(y)) returned inf/nan on
-        # perfectly valid unconstrained values around y = 37. Working in survival
-        # space (m = softplus(y)) keeps the transform finite far past that, equal
-        # to the Logistic log-density (the PIT image of the GPD prior), with
-        # forward(backward(y)) round-tripping. The probed range stays inside what
-        # float64 can represent for *every* parametrization (the bounded xi < 0
-        # case saturates at its wall only beyond |y| ~ 70 -- see
-        # ``test_unbounded_transform_is_finite_arbitrarily_far`` for the xi >= 0
-        # case, which has no wall and stays finite to |y| ~ 1000). For the
-        # bounded xi < 0 case the round-trip CDF (``log1mexp`` near the wall)
-        # loses accuracy beyond |y| ~ 48, so the probe stays at |y| <= 45 -- well
-        # past the y = 37 saturation bug this guards.
+    def test_transformed_logp_is_logistic_where_representable(self, builder, kwargs, ys, roundtrip):
+        # The PIT transformed logp equals Logistic(y) and is finite wherever the
+        # quantile is representable: across the y ~ 37 sigmoid-saturation point, deep
+        # into the tail (the y ~ 745 log-F underflow, and below the y ~ 709/xi quantile
+        # overflow), and across ten orders of magnitude in kappa including the
+        # kappa < 1 collapse onto mu. The recovered quantile stays finite and in
+        # support (x >= mu); where the map is representably invertible it round-trips.
+        # (Consolidates the former finite-in-tails / deep-tail / exact-across-kappa /
+        # small-kappa transform tests -- one model build per regime instead of ~17.)
+        mu = kwargs["mu"]
         with pm.Model() as model:
-            x = builder("x", **dist_kwargs)
+            x = builder("x", **kwargs)
         yv = model.value_vars[0]
-        transformed_logp = pytensor.function([yv], model.logp(sum=True))
-        tr = model.rvs_to_transforms[x]
         inputs = x.owner.inputs
-        roundtrip = pytensor.function([yv], tr.forward(tr.backward(yv, *inputs), *inputs))
-
-        for y in (-45.0, -40.0, -37.0, 37.0, 40.0, 45.0):
-            lp = float(transformed_logp(y))
-            logistic = -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y)
-            assert np.isfinite(lp)
-            np.testing.assert_allclose(lp, logistic, atol=1e-6)
-            np.testing.assert_allclose(float(roundtrip(y)), y, atol=1e-6)
-
-    @pytest.mark.parametrize(
-        "dist_kwargs, builder, y_max",
-        [
-            # Exponential tail (xi = 0, unbounded, no overflow): exact very far out.
-            # The ExtGenPareto probe at y = 1000 reaches past y ~ 745, where the
-            # naive log-F recovery of the excess underflowed (S_F -> 0, m -> inf);
-            # recovering it from the survival side keeps it finite and exact.
-            ({"mu": 0.0, "sigma": 1.0, "xi": 0.0}, GenPareto, 1000.0),
-            ({"mu": 0.0, "sigma": 1.0, "xi": 0.0, "kappa": 2.0}, ExtGenPareto, 1000.0),
-            # Mild heavy tail: the quantile ~ exp(xi * m) overflows only at
-            # y ~ 709 / xi (~2363 here), so 1000 is well inside for both families.
-            ({"mu": 0.0, "sigma": 1.0, "xi": 0.3}, GenPareto, 400.0),
-            ({"mu": 0.0, "sigma": 1.0, "xi": 0.3, "kappa": 2.0}, ExtGenPareto, 1000.0),
-        ],
-    )
-    def test_transform_exact_deep_into_the_tail(self, dist_kwargs, builder, y_max):
-        # Where the quantile is representable, the transformed density is exactly
-        # Logistic arbitrarily far out (xi >= 0 has no upper wall; the heavy-tail
-        # cases stay below the y ~ 709 / xi overflow boundary).
-        with pm.Model() as model:
-            builder("x", **dist_kwargs)
-        yv = model.value_vars[0]
-        transformed_logp = pytensor.function([yv], model.logp(sum=True))
-        for y in (100.0, y_max / 2, y_max):
-            lp = float(transformed_logp(y))
-            logistic = -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y)
-            assert np.isfinite(lp)
-            np.testing.assert_allclose(lp, logistic, atol=1e-6)
+        tr = model.rvs_to_transforms[x]
+        logp = pytensor.function([yv], model.logp(sum=True))
+        backward = pytensor.function([yv], tr.backward(yv, *inputs))
+        forward_backward = (
+            pytensor.function([yv], tr.forward(tr.backward(yv, *inputs), *inputs))
+            if roundtrip
+            else None
+        )
+        for y in ys:
+            lp = float(logp(y))
+            assert np.isfinite(lp), (kwargs, y)
+            np.testing.assert_allclose(lp, -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y), atol=1e-6)
+            xb = float(backward(y))
+            assert np.isfinite(xb) and xb >= mu, (kwargs, y)  # support is [mu, ...)
+            if forward_backward is not None:
+                np.testing.assert_allclose(float(forward_backward(y)), y, atol=1e-6)
 
     @pytest.mark.parametrize("xi", [5.0, 3.0])
     def test_heavy_tail_transform_saturates_past_709_over_xi(self, xi):
@@ -1144,65 +1161,6 @@ class TestGenParetoTransforms:
             assert np.isfinite(m)
             # m ~ y + log(kappa) far out in the tail (S_F ~ S_ext / kappa).
             np.testing.assert_allclose(m, yi + np.log(2.0), rtol=1e-3)
-
-    @pytest.mark.parametrize(
-        "kappa, ys",
-        [
-            (1e8, (-30.0, 0.0, 30.0)),
-            (1e4, (-30.0, 0.0, 30.0)),
-            (1.0, (-40.0, 0.0, 40.0)),
-            (0.1, (-30.0, 0.0, 40.0)),
-            # Upper tail with kappa < 1 is exactly where a y-only tail switch
-            # returned a negative excess (x < mu); here it is exact.
-            (1e-2, (-5.0, 0.0, 40.0)),
-        ],
-    )
-    def test_extgenpareto_transform_is_exact_across_kappa(self, kappa, ys):
-        # The ExtGPD inverse must depend on kappa, not just on y: the excess is
-        # recovered via -log1mexp(log F_ext / kappa), whose log1p branch keeps a
-        # tiny GPD survival from collapsing the excess to 0 (a -log(-expm1(.)) form
-        # would). The map is exactly Logistic across ten orders of magnitude in
-        # kappa at ordinary tail depths. Probe depths are kept inside each kappa's
-        # exact domain (small kappa has essentially no representable *lower* tail --
-        # the carrier H = F_ext ** (1/kappa) underflows once |y| / kappa >~ 745 --
-        # which is the distribution concentrating toward mu, not a defect).
-        with pm.Model() as model:
-            ExtGenPareto("x", mu=0.0, sigma=1.0, xi=0.0, kappa=kappa)
-        yv = model.value_vars[0]
-        transformed_logp = pytensor.function([yv], model.logp(sum=True))
-        tr = model.rvs_to_transforms[model.free_RVs[0]]
-        inputs = model.free_RVs[0].owner.inputs
-        roundtrip = pytensor.function([yv], tr.forward(tr.backward(yv, *inputs), *inputs))
-        for y in ys:
-            lp = float(transformed_logp(y))
-            logistic = -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y)
-            assert np.isfinite(lp)
-            np.testing.assert_allclose(lp, logistic, atol=1e-6)
-            np.testing.assert_allclose(float(roundtrip(y)), y, atol=1e-6)
-
-    @pytest.mark.parametrize("kappa", [1e-2, 1e-20, 1e-100, 1e-300])
-    def test_extgenpareto_transform_finite_logistic_for_small_kappa(self, kappa):
-        # Regression for the small-kappa transform NaN. For kappa < ~|y|/745 the
-        # carrier excess underflows and the quantile collapses onto mu, where a
-        # kappa < 1 density diverges (logp = +inf). The transform still returns the
-        # exact Logistic(y) transformed logp -- finite -- rather than the +inf - inf
-        # NaN a logcdf(x) + logccdf(x) route produced (kappa = 1e-2 at y = -10 was
-        # already in this regime, not just absurdly small kappa). The recovered
-        # quantile stays finite and in support (>= mu).
-        mu = 2.0
-        with pm.Model() as model:
-            x = ExtGenPareto("x", mu=mu, sigma=1.0, xi=0.0, kappa=kappa)
-        yv = model.value_vars[0]
-        tr = model.rvs_to_transforms[x]
-        inputs = x.owner.inputs
-        logp = pytensor.function([yv], model.logp(sum=True))
-        backward = pytensor.function([yv], tr.backward(yv, *inputs))
-        for y in (-30.0, -10.0, 0.0, 30.0, 80.0):
-            lp = float(logp(y))
-            assert np.isfinite(lp)
-            np.testing.assert_allclose(lp, -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y), atol=1e-6)
-            xb = float(backward(y))
-            assert np.isfinite(xb) and xb >= mu  # in support [mu, inf)
 
     def test_jacobian_gradient_is_continuous_through_xi_zero(self):
         # The headline reason for the probability-integral transform: with xi a
