@@ -592,28 +592,28 @@ class TestGenParetoBoundaries:
 
     def test_logp_logcdf_at_infinity(self):
         # density at +inf is 0 (logp -inf); CDF at +inf is 1 (logcdf 0). The
-        # xi=0 path is the delicate one: xi*inf is nan without _safe_mul.
-        for xi in (-0.5, 0.0, 0.5):
-            assert pm.logp(GenPareto.dist(mu=0.0, sigma=1.0, xi=xi), np.inf).eval() == -np.inf
-            assert pm.logcdf(GenPareto.dist(mu=0.0, sigma=1.0, xi=xi), np.inf).eval() == 0.0
-            ext = ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=xi, kappa=2.0)
-            assert pm.logp(ext, np.inf).eval() == -np.inf
-            assert pm.logcdf(ext, np.inf).eval() == 0.0
+        # xi=0 path is the delicate one: xi*inf is nan without _safe_mul. Batch the
+        # three xi into one dist so each method compiles once, not once per xi.
+        xi = np.array([-0.5, 0.0, 0.5])
+        for dist in (
+            GenPareto.dist(mu=0.0, sigma=1.0, xi=xi),
+            ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=xi, kappa=2.0),
+        ):
+            assert np.all(pm.logp(dist, np.inf).eval() == -np.inf)
+            assert np.all(pm.logcdf(dist, np.inf).eval() == 0.0)
 
     def test_icdf_endpoints(self):
         # q=0 -> mu (lower endpoint); q=1 -> finite upper bound (xi<0) or +inf.
-        for xi in (-0.5, 0.0, 0.5):
-            expected_hi = 1.0 - 2.0 / xi if xi < 0 else np.inf
-            assert pm.icdf(GenPareto.dist(mu=1.0, sigma=2.0, xi=xi), 0.0).eval() == 1.0
-            np.testing.assert_allclose(
-                pm.icdf(GenPareto.dist(mu=1.0, sigma=2.0, xi=xi), 1.0).eval(), expected_hi
-            )
+        # Batch the three xi into one dist so each endpoint compiles once, not per xi.
+        xi = np.array([-0.5, 0.0, 0.5])
+        with np.errstate(divide="ignore"):  # xi = 0 -> inf upper bound, not a warning
+            expected_hi = np.where(xi < 0, 1.0 - 2.0 / xi, np.inf)
         # ExtGPD shares the same endpoints (carrier maps 0->0, 1->1).
-        for xi, kappa in ((-0.5, 2.0), (0.0, 0.5), (0.5, 3.0)):
-            expected_hi = 1.0 - 2.0 / xi if xi < 0 else np.inf
-            ext = ExtGenPareto.dist(mu=1.0, sigma=2.0, xi=xi, kappa=kappa)
-            assert pm.icdf(ext, 0.0).eval() == 1.0
-            np.testing.assert_allclose(pm.icdf(ext, 1.0).eval(), expected_hi)
+        gpd = GenPareto.dist(mu=1.0, sigma=2.0, xi=xi)
+        ext = ExtGenPareto.dist(mu=1.0, sigma=2.0, xi=xi, kappa=np.array([2.0, 0.5, 3.0]))
+        for dist in (gpd, ext):
+            assert np.all(pm.icdf(dist, 0.0).eval() == 1.0)
+            np.testing.assert_allclose(pm.icdf(dist, 1.0).eval(), expected_hi)
 
     def test_icdf_outside_unit_interval_is_nan(self):
         for q in (-0.1, 1.1):
@@ -643,19 +643,20 @@ class TestGenParetoBoundaries:
         # ``xi = +-inf``, so the guard keys on ``isfinite(xi)`` directly.
         # sanity: the xi = 0 branch is finite at x = 1, so a masked -inf would hide it
         assert np.isfinite(pm.logp(GenPareto.dist(mu=0.0, sigma=1.0, xi=0.0), 1.0).eval())
+        # in support (x=1), at the lower endpoint (x=mu=0), below (x=-1), above (+inf);
+        # icdf incl the q = 0 / 1 endpoints (which otherwise hand back mu / the upper
+        # bound regardless of the invalid shape). Probe all points in one vectorised
+        # eval per method so the test does not recompile once per (point, method).
+        xs = np.array([1.0, 0.0, -1.0, np.inf])
+        qs = np.array([0.0, 0.5, 1.0])
         for dist in (
             GenPareto.dist(mu=0.0, sigma=1.0, xi=bad_xi),
             ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=bad_xi, kappa=2.0),
         ):
-            # in support (x=1), at the lower endpoint (x=mu=0), below (x=-1), above (+inf)
-            for x in (1.0, 0.0, -1.0, np.inf):
-                assert np.isnan(pm.logp(dist, x).eval())
-                assert np.isnan(pm.logcdf(dist, x).eval())
-                assert np.isnan(pm.logccdf(dist, x).eval())
-            # icdf too, INCLUDING the q = 0 / 1 endpoints (which otherwise hand back
-            # mu / the upper bound regardless of the invalid shape).
-            for q in (0.0, 0.5, 1.0):
-                assert np.isnan(pm.icdf(dist, q).eval())
+            assert np.all(np.isnan(pm.logp(dist, xs).eval()))
+            assert np.all(np.isnan(pm.logcdf(dist, xs).eval()))
+            assert np.all(np.isnan(pm.logccdf(dist, xs).eval()))
+            assert np.all(np.isnan(pm.icdf(dist, qs).eval()))
 
     def test_nonfinite_kappa_propagates_consistently(self):
         # ``kappa = inf`` passes the ``kappa > 0`` check (inf > 0 is True), so the
@@ -664,12 +665,11 @@ class TestGenParetoBoundaries:
         # logcdf / logccdf / icdf -- including the icdf endpoints -- not leak the
         # inconsistent nan / -inf / 0 / bound the un-guarded branches would.
         dist = ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.3, kappa=np.inf)
-        for x in (1.0, 0.0, -1.0):
-            assert np.isnan(pm.logp(dist, x).eval())
-            assert np.isnan(pm.logcdf(dist, x).eval())
-            assert np.isnan(pm.logccdf(dist, x).eval())
-        for q in (0.0, 0.5, 1.0):
-            assert np.isnan(pm.icdf(dist, q).eval())
+        xs = np.array([1.0, 0.0, -1.0])
+        assert np.all(np.isnan(pm.logp(dist, xs).eval()))
+        assert np.all(np.isnan(pm.logcdf(dist, xs).eval()))
+        assert np.all(np.isnan(pm.logccdf(dist, xs).eval()))
+        assert np.all(np.isnan(pm.icdf(dist, np.array([0.0, 0.5, 1.0])).eval()))
         # ``kappa = nan`` fails ``kappa > 0`` (nan > 0 is False) and raises instead.
         with pytest.raises(ParameterValueError):
             pm.logp(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.3, kappa=np.nan), 1.0).eval()
@@ -1219,16 +1219,17 @@ class TestGenParetoTransforms:
         grad_plus = float(fn(1e-6, 0.5))
         assert abs(grad_minus - grad_plus) < 1e-3
 
-    @pytest.mark.parametrize(
-        "xi, mu, sigma",
-        [(0.3, 5.0, 1.0), (0.0, 0.0, 2.0), (-0.5, 0.0, 1.0)],
-    )
-    def test_latent_sampling_stays_in_support(self, xi, mu, sigma):
+    def test_latent_sampling_stays_in_support(self):
+        # The three geometries -- heavy (xi > 0), exponential (xi = 0), and bounded
+        # (xi < 0) -- are sampled as three independent latents in ONE model. Real NUTS
+        # is the point (it exercises the transform's gradient), but the cost is the
+        # per-model sampler compile, not the draws, so one combined model is far
+        # cheaper than three and still checks each geometry. Fixed seed + cores=1 keep
+        # it deterministic and process-spawn-free for CI.
+        geometries = [(0.3, 5.0, 1.0), (0.0, 0.0, 2.0), (-0.5, 0.0, 1.0)]
         with pm.Model() as model:
-            GenPareto("x", mu=mu, sigma=sigma, xi=xi)
-            # Keep this real-NUTS check cheap and deterministic for CI: a fixed seed
-            # plus cores=1 (no per-chain process spawn); the clean PIT geometry needs
-            # only a short run to stay in support with zero divergences.
+            for i, (xi, mu, sigma) in enumerate(geometries):
+                GenPareto(f"x{i}", mu=mu, sigma=sigma, xi=xi)
             idata = pm.sample(
                 100,
                 tune=200,
@@ -1238,11 +1239,13 @@ class TestGenParetoTransforms:
                 random_seed=1,
                 compute_convergence_checks=False,
             )
-        xs = idata.posterior["x"].values
-        assert np.all(xs >= mu - 1e-9)
-        if xi < 0:
-            assert np.all(xs <= mu - sigma / xi + 1e-9)  # finite upper wall
+        # The clean PIT geometry should give zero divergences for all three at once.
         assert int(idata.sample_stats.diverging.values.sum()) == 0
+        for i, (xi, mu, sigma) in enumerate(geometries):
+            xs = idata.posterior[f"x{i}"].values
+            assert np.all(xs >= mu - 1e-9), f"x{i} (xi={xi}) below mu"
+            if xi < 0:
+                assert np.all(xs <= mu - sigma / xi + 1e-9), f"x{i} (xi={xi}) past wall"
 
     def test_observed_is_unaffected(self):
         # Observed data is fixed, so the transform must not change its logp.
