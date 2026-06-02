@@ -1065,6 +1065,7 @@ class TestGenParetoTransforms:
             {"xi": -np.inf, "kappa": 1.0},
             {"xi": 0.0, "kappa": np.inf},
             {"xi": np.inf},  # GenPareto (no kappa)
+            {"xi": -np.inf},  # GenPareto, other sign
         ],
     )
     def test_nonfinite_shape_does_not_leak_a_finite_logistic_through_the_transform(self, kw):
@@ -1081,7 +1082,9 @@ class TestGenParetoTransforms:
             [model.value_vars[0]], model.logp(sum=True), on_unused_input="ignore"
         )
         for y in (-3.0, 0.0, 3.0):
-            assert not np.isfinite(float(logp(y)))  # NaN, never a spurious finite value
+            # Must be NaN specifically (an invalid parameter), not -inf -- so a future
+            # regression that turns it into a clean reject instead of NaN still fails.
+            assert np.isnan(float(logp(y)))
         # ... and the model-level loud guard fires (the practical symptom of the bug).
         with pytest.raises(pm.exceptions.SamplingError):
             model.check_start_vals(model.initial_point())
