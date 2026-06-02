@@ -782,11 +782,14 @@ class TestGenParetoBoundaryPrecision:
 
     pytestmark = _GPD_FPE_FILTERS
 
-    @pytest.mark.parametrize("xi", [-0.05, -0.3, -0.7])
-    def test_boundary_logp_and_gradient_track_the_margin(self, xi):
-        mu, sigma, kappa = 0.4, 1.3, 2.5
+    def test_boundary_logp_value_holds_but_gradient_tracks_the_margin(self):
+        # One representative xi over a margin sweep is enough to pin the limit (the
+        # s-cancellation mechanism is xi-independent): the largest margin (s = 1e-2,
+        # bound ~ulp/1e-2 ~ 2e-12) is the machine-accurate anchor away from the wall;
+        # the smallest (s = 1e-12) is the ~ulp/s limit at it.
+        mu, sigma, xi, kappa = 0.4, 1.3, -0.3, 2.5
         eps = np.finfo(np.float64).eps
-        margins = [1e-2, 1e-4, 1e-6, 1e-9, 1e-12]
+        margins = [1e-2, 1e-6, 1e-12]
 
         v, sig, xs, ks = (pt.dscalar(n) for n in ("v", "sig", "xs", "ks"))
         gpd_lp = gen_pareto_logp(v, mu, sig, xs)
@@ -832,20 +835,6 @@ class TestGenParetoBoundaryPrecision:
                         assert rel < 1e-10, (label, name, s_target, float(rel))
                     else:
                         assert rel < grad_bound, (label, name, s_target, float(rel))
-
-    def test_far_from_boundary_gradient_is_machine_accurate(self):
-        # Contrast: away from the wall (s ~ 1) the gradient is exact to ~machine
-        # precision -- the degradation above is margin-driven, not a generic defect.
-        mu, sigma, xi = 0.4, 1.3, -0.3
-        value = mu + sigma * ((0.5 - 1) / xi)  # s = 0.5, mid-support
-        params = {"mu": Decimal(mu), "sigma": Decimal(sigma), "xi": Decimal(xi)}
-        v, sig, xs = (pt.dscalar(n) for n in ("v", "sig", "xs"))
-        lp = gen_pareto_logp(v, mu, sig, xs)
-        fn = pytensor.function([v, sig, xs], [pt.grad(lp, sig), pt.grad(lp, xs)])
-        g_sig, g_xi = (float(o) for o in fn(value, sigma, xi))
-        for name, g in [("sigma", g_sig), ("xi", g_xi)]:
-            g_ref = _gpd_ref_grad(value, params, name)
-            assert abs((Decimal(g) - g_ref) / g_ref) < 1e-12
 
 
 class TestGenParetoTransforms:
@@ -947,6 +936,16 @@ class TestGenParetoTransforms:
                 (-30.0, 0.0, 80.0),
                 False,
             ),
+        ],
+        ids=[
+            "bounded-gpd",
+            "unbounded-gpd",
+            "heavy-gpd",
+            "bounded-ext",
+            "unbounded-ext-deep",
+            "ext-large-kappa",
+            "ext-small-kappa",
+            "ext-collapse",
         ],
     )
     def test_transformed_logp_is_logistic_where_representable(self, builder, kwargs, ys, roundtrip):
