@@ -880,7 +880,11 @@ class GenPareto(Continuous):
         assert pareto_mu < xmin  # exceedances lie strictly above the threshold
 
         with pm.Model():
-            pareto_sigma = pm.Exponential("pareto_sigma", 1.0)
+            # sigma is the one dimensional parameter; a log-scale (here a broad
+            # LogNormal) prior keeps the dimensionless xi inference invariant to the
+            # data's units. A fixed-scale prior (e.g. Exponential(1)) silently biases
+            # xi when the data are not O(1).
+            pareto_sigma = pm.LogNormal("pareto_sigma", mu=0.0, sigma=10.0)
             # xi floored at the data-in-support bound -sigma/(xmax-mu) AND at -1
             # (xi <= -1 diverges the density at the upper wall -> unbounded likelihood).
             pareto_xi = pm.TruncatedNormal(
@@ -900,11 +904,13 @@ class GenPareto(Continuous):
     wall noted above (reached only when the wall is pinned within ``~1e-13`` of the
     data).
 
-    The threshold ``mu`` is held fixed -- the standard peaks-over-threshold setup.
-    Estimating it jointly with ``(sigma, xi)`` is the harder three-parameter GPD
-    problem, but it does not blow up here: the GPD density at the lower endpoint is
-    finite (``1/sigma``). That is *not* true of :class:`ExtGenPareto`, where a free
-    ``mu`` reintroduces an unbounded likelihood -- see its Examples.
+    The threshold ``mu`` is held fixed -- the standard peaks-over-threshold setup,
+    and load-bearing: a *free* ``mu`` makes the likelihood unbounded. For the GPD
+    this is the classic three-parameter pathology -- ``mu`` slides onto
+    ``min(data)`` while ``sigma -> 0``, which diverges once ``xi > n - 1`` (a heavy
+    tail relative to the sample size, so usually only reachable for tiny samples).
+    For :class:`ExtGenPareto` it is far easier to hit (``mu -> min(data)`` alone, for
+    any ``kappa < 1``); see its Examples.
     """
 
     rv_type = GenParetoRV
@@ -1063,7 +1069,11 @@ class ExtGenPareto(Continuous):
         assert pareto_mu < xmin  # strict: a kappa < 1 density diverges at x = mu
 
         with pm.Model():
-            pareto_sigma = pm.Exponential("pareto_sigma", 1.0)
+            # sigma is the one dimensional parameter; a log-scale (here a broad
+            # LogNormal) prior keeps the dimensionless xi inference invariant to the
+            # data's units. A fixed-scale prior (e.g. Exponential(1)) silently biases
+            # xi when the data are not O(1).
+            pareto_sigma = pm.LogNormal("pareto_sigma", mu=0.0, sigma=10.0)
             pareto_kappa = pm.Gamma("pareto_kappa", alpha=2, beta=1)
             # xi floored at the data-in-support bound -sigma/(xmax-mu) AND at -1
             # (xi <= -1 diverges the density at the upper wall -> unbounded likelihood).
