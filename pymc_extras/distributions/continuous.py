@@ -880,10 +880,7 @@ class GenPareto(Continuous):
         assert pareto_mu < xmin  # exceedances lie strictly above the threshold
 
         with pm.Model():
-            # sigma is the one dimensional parameter; a log-scale (here a broad
-            # LogNormal) prior keeps the dimensionless xi inference invariant to the
-            # data's units. A fixed-scale prior (e.g. Exponential(1)) silently biases
-            # xi when the data are not O(1).
+            # log-scale prior keeps the dimensionless xi inference scale-invariant
             pareto_sigma = pm.LogNormal("pareto_sigma", mu=0.0, sigma=10.0)
             # xi floored at the data-in-support bound -sigma/(xmax-mu) AND at -1
             # (xi <= -1 diverges the density at the upper wall -> unbounded likelihood).
@@ -1069,10 +1066,7 @@ class ExtGenPareto(Continuous):
         assert pareto_mu < xmin  # strict: a kappa < 1 density diverges at x = mu
 
         with pm.Model():
-            # sigma is the one dimensional parameter; a log-scale (here a broad
-            # LogNormal) prior keeps the dimensionless xi inference invariant to the
-            # data's units. A fixed-scale prior (e.g. Exponential(1)) silently biases
-            # xi when the data are not O(1).
+            # log-scale prior keeps the dimensionless xi inference scale-invariant
             pareto_sigma = pm.LogNormal("pareto_sigma", mu=0.0, sigma=10.0)
             pareto_kappa = pm.Gamma("pareto_kappa", alpha=2, beta=1)
             # xi floored at the data-in-support bound -sigma/(xmax-mu) AND at -1
