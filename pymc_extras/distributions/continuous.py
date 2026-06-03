@@ -860,7 +860,10 @@ class GenPareto(Continuous):
     constraint is the upper wall, ``max(data) < mu - sigma/xi``, which rearranges to
     a *lower* bound on the shape, ``xi > -sigma / (max(data) - mu)`` (there is no
     upper bound -- :math:`\xi \geq 0` is an unbounded tail that always contains the
-    data). Encoding that as the lower bound of an otherwise broad prior on
+    data). The shape is *also* floored at ``xi > -1``: for :math:`\xi \leq -1` the
+    density diverges at the upper endpoint, making the likelihood unbounded (an
+    improper posterior NUTS runs away to) -- ``xi > -1`` is the usual regularity
+    condition. Encoding both as the lower bound of an otherwise broad prior on
     :math:`\xi` lets NUTS sample the whole shape range -- bounded and unbounded
     tails alike -- without the support-wall divergences a free ``(sigma, xi)`` pair
     suffers: the transform stretches the wall to infinity in the unconstrained
@@ -878,12 +881,13 @@ class GenPareto(Continuous):
 
         with pm.Model():
             pareto_sigma = pm.Exponential("pareto_sigma", 1.0)
-            # data in support  <=>  xi > -sigma / (xmax - mu); no upper bound.
+            # xi floored at the data-in-support bound -sigma/(xmax-mu) AND at -1
+            # (xi <= -1 diverges the density at the upper wall -> unbounded likelihood).
             pareto_xi = pm.TruncatedNormal(
                 "pareto_xi",
                 mu=0.0,
                 sigma=2.0,
-                lower=-pareto_sigma / (xmax - pareto_mu),
+                lower=pm.math.maximum(-1.0, -pareto_sigma / (xmax - pareto_mu)),
             )
             GenPareto("obs", mu=pareto_mu, sigma=pareto_sigma, xi=pareto_xi, observed=data)
             idata = pm.sample()
@@ -895,6 +899,12 @@ class GenPareto(Continuous):
     stability*; it is distinct from the deeper float64 precision limit right at the
     wall noted above (reached only when the wall is pinned within ``~1e-13`` of the
     data).
+
+    The threshold ``mu`` is held fixed -- the standard peaks-over-threshold setup.
+    Estimating it jointly with ``(sigma, xi)`` is the harder three-parameter GPD
+    problem, but it does not blow up here: the GPD density at the lower endpoint is
+    finite (``1/sigma``). That is *not* true of :class:`ExtGenPareto`, where a free
+    ``mu`` reintroduces an unbounded likelihood -- see its Examples.
     """
 
     rv_type = GenParetoRV
@@ -1034,10 +1044,11 @@ class ExtGenPareto(Continuous):
 
     Examples
     --------
-    The upper tail is the GPD tail, so fit it the same way: bound :math:`\xi`
-    below by ``-sigma / (max(data) - mu)`` to keep the data inside the support and
-    sample without support-wall divergences (see :class:`GenPareto` Examples for
-    why). ``kappa`` only reshapes the lower tail; a ``Gamma(2, 1)`` prior (density
+    The upper tail is the GPD tail, so fit it the same way: floor :math:`\xi` at
+    both ``-sigma / (max(data) - mu)`` (data inside the support) and ``-1`` (below
+    which the upper-endpoint density diverges into an unbounded likelihood) to
+    sample without support-wall divergences or a runaway (see :class:`GenPareto`
+    Examples for why). ``kappa`` only reshapes the lower tail; a ``Gamma(2, 1)`` prior (density
     ``-> 0`` at the origin, mode at 1) keeps it off the degenerate ``kappa -> 0``
     limit, where the distribution collapses toward a point mass and ``sigma`` can
     run away to compensate.
@@ -1054,11 +1065,13 @@ class ExtGenPareto(Continuous):
         with pm.Model():
             pareto_sigma = pm.Exponential("pareto_sigma", 1.0)
             pareto_kappa = pm.Gamma("pareto_kappa", alpha=2, beta=1)
+            # xi floored at the data-in-support bound -sigma/(xmax-mu) AND at -1
+            # (xi <= -1 diverges the density at the upper wall -> unbounded likelihood).
             pareto_xi = pm.TruncatedNormal(
                 "pareto_xi",
                 mu=0.0,
                 sigma=2.0,
-                lower=-pareto_sigma / (xmax - pareto_mu),
+                lower=pm.math.maximum(-1.0, -pareto_sigma / (xmax - pareto_mu)),
             )
             ExtGenPareto(
                 "obs",
@@ -1069,6 +1082,14 @@ class ExtGenPareto(Continuous):
                 observed=data,
             )
             idata = pm.sample()
+
+    Keep ``mu`` fixed. It is the lower endpoint of the support, where a
+    ``kappa < 1`` density diverges; fixing the threshold keeps that singularity away
+    from the data. A *free* ``mu`` slides up to ``min(data)`` to sit on the
+    divergence -- an unbounded likelihood / improper posterior, the lower-endpoint
+    mirror of the ``xi <= -1`` upper wall (NUTS pins ``mu`` to ``min(data)`` with
+    ``kappa < 1``). If the threshold must be estimated, floor ``kappa >= 1`` (no
+    lower divergence) or put a prior on ``min(data) - mu`` that vanishes at 0.
     """
 
     rv_type = ExtGenParetoRV
