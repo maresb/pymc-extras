@@ -957,9 +957,13 @@ class ExtGenPareto(Continuous):
        F(x \mid \mu, \sigma, \xi, \kappa) =
            \left[H\!\left(x \mid \mu, \sigma, \xi\right)\right]^{\kappa}.
 
-    The shape :math:`\xi` governs the upper tail exactly as in the GPD, while
-    :math:`\kappa > 0` reshapes the lower tail (a single, threshold-free model
-    for low, moderate and heavy values). :math:`\kappa = 1` recovers the GPD.
+    This is the Type 1 family of Naveau et al. (2016) [1]_, equivalently the EGP3
+    model of Papastathopoulos and Tawn (2013) [2]_. The shape :math:`\xi` governs
+    the upper tail exactly as in the GPD, while :math:`\kappa > 0` reshapes the
+    lower tail (a single, threshold-free model for low, moderate and heavy values);
+    because it models the body, the tail-index, scale and return-level estimates are
+    stabler to the choice of threshold, allowing a lower one than a plain GPD fit.
+    :math:`\kappa = 1` recovers the GPD.
 
     .. plot::
         :context: close-figs
