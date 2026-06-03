@@ -221,10 +221,10 @@ class TestMaxwell:
 # invalid-xi probe (there is no invalid xi) while still exercising every listed
 # value -- the exponential limit xi = 0 and both tails. Two deliberate bounds on
 # the range:
-#   * strictly > -1: at xi <= -1 the GPD becomes (sub-)uniform with a *finite*
-#     density at its closed upper endpoint, a measure-zero point where the
-#     open-support convention here (-inf at the wall) legitimately differs from
-#     SciPy. ``TestGenParetoBoundaries`` covers the xi < 0 wall directly.
+#   * strictly > -1: at the closed upper endpoint the open-support convention here
+#     (-inf at the wall) legitimately differs from SciPy -- a measure-zero point --
+#     and for xi < -1 the density there even diverges. ``TestGenParetoBoundaries``
+#     covers the xi < 0 wall directly.
 #   * <= 1: a heavier tail (e.g. xi = 5) pushes the q = 0.99 quantile to ~1e10,
 #     where ``check_icdf``'s *absolute* tolerance fails on a value that is in
 #     fact correct to ~1e-15 relative -- false precision, not a real error.
@@ -1167,8 +1167,27 @@ class TestGenParetoTransforms:
         for yi in (90.0, 200.0, 700.0, 5000.0):
             m = float(fn(np.float32(yi)))
             assert np.isfinite(m)
-            # m ~ y + log(kappa) far out in the tail (S_F ~ S_ext / kappa).
+            # m ~ y + log(kappa) far out in the tail (S_ext / kappa << 1 there).
             np.testing.assert_allclose(m, yi + np.log(2.0), rtol=1e-3)
+
+    def test_excess_from_y_resolves_subnormal_kappa_tail(self):
+        # For subnormal kappa, exp(-y)/kappa is O(1) in the tail, so the carrier
+        # survival must be inverted exactly (m = -log(1 - F_ext ** (1/kappa))) -- a
+        # S_ext/kappa << 1 asymptotic returns a negative "excess" and collapses
+        # backward onto the floor. Reference m(y=710, kappa=4e-309, xi=0) = 0.3953903.
+        y = pt.dscalar("y")
+        excess = float(
+            pytensor.function([y], _ExtGenParetoPIT._excess_from_y(y, 0.0, 1.0, 0.0, 4e-309))(710.0)
+        )
+        assert excess > 0.0
+        np.testing.assert_allclose(excess, 0.395390331, rtol=1e-4)
+        with pm.Model() as model:
+            x = ExtGenPareto("x", mu=0.0, sigma=1.0, xi=0.0, kappa=4e-309)
+        tr = model.rvs_to_transforms[x]
+        inputs = x.owner.inputs
+        yv = model.value_vars[0]
+        roundtrip = pytensor.function([yv], tr.forward(tr.backward(yv, *inputs), *inputs))
+        np.testing.assert_allclose(float(roundtrip(710.0)), 710.0, rtol=1e-5)
 
     def test_jacobian_gradient_is_continuous_through_xi_zero(self):
         # The headline reason for the probability-integral transform: with xi a

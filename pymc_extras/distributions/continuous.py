@@ -860,7 +860,7 @@ class GenPareto(Continuous):
     constraint is the upper wall, ``max(data) < mu - sigma/xi``, which rearranges to
     a *lower* bound on the shape, ``xi > -sigma / (max(data) - mu)`` (there is no
     upper bound -- :math:`\xi \geq 0` is an unbounded tail that always contains the
-    data). The shape is *also* floored at ``xi > -1``: for :math:`\xi \leq -1` the
+    data). The shape is *also* floored at ``xi > -1``: for :math:`\xi < -1` the
     density diverges at the upper endpoint, making the likelihood unbounded (an
     improper posterior NUTS runs away to) -- ``xi > -1`` is the usual regularity
     condition. Encoding both as the lower bound of an otherwise broad prior on
@@ -880,11 +880,11 @@ class GenPareto(Continuous):
         assert pareto_mu < xmin  # exceedances lie strictly above the threshold
 
         with pm.Model():
-            # sigma carries the data's units, so a broad prior on log(sigma) makes
-            # the shape xi inference invariant to rescaling the data.
+            # sigma carries the data's units; a broad prior on log(sigma) keeps the
+            # shape xi inference robust across many orders of magnitude of data scale.
             pareto_sigma = pm.LogNormal("pareto_sigma", mu=0.0, sigma=10.0)
             # xi floored at the data-in-support bound -sigma/(xmax-mu) AND at -1
-            # (xi <= -1 diverges the density at the upper wall -> unbounded likelihood).
+            # (xi < -1 diverges the density at the upper wall -> unbounded likelihood).
             pareto_xi = pm.TruncatedNormal(
                 "pareto_xi",
                 mu=0.0,
@@ -1067,12 +1067,12 @@ class ExtGenPareto(Continuous):
         assert pareto_mu < xmin  # strict: a kappa < 1 density diverges at x = mu
 
         with pm.Model():
-            # sigma carries the data's units, so a broad prior on log(sigma) makes
-            # the shape xi inference invariant to rescaling the data.
+            # sigma carries the data's units; a broad prior on log(sigma) keeps the
+            # shape xi inference robust across many orders of magnitude of data scale.
             pareto_sigma = pm.LogNormal("pareto_sigma", mu=0.0, sigma=10.0)
             pareto_kappa = pm.Gamma("pareto_kappa", alpha=2, beta=1)
             # xi floored at the data-in-support bound -sigma/(xmax-mu) AND at -1
-            # (xi <= -1 diverges the density at the upper wall -> unbounded likelihood).
+            # (xi < -1 diverges the density at the upper wall -> unbounded likelihood).
             pareto_xi = pm.TruncatedNormal(
                 "pareto_xi",
                 mu=0.0,
@@ -1093,7 +1093,7 @@ class ExtGenPareto(Continuous):
     ``kappa < 1`` density diverges; fixing the threshold keeps that singularity away
     from the data. A *free* ``mu`` slides up to ``min(data)`` to sit on the
     divergence -- an unbounded likelihood / improper posterior, the lower-endpoint
-    mirror of the ``xi <= -1`` upper wall (NUTS pins ``mu`` to ``min(data)`` with
+    mirror of the ``xi < -1`` upper wall (NUTS pins ``mu`` to ``min(data)`` with
     ``kappa < 1``). If the threshold must be estimated, floor ``kappa >= 1`` (no
     lower divergence) or put a prior on ``min(data) - mu`` that vanishes at 0.
     """
@@ -1342,35 +1342,33 @@ class _ExtGenParetoPIT(_GPDProbabilityIntegralTransform):
 
     @staticmethod
     def _excess_from_y(value, mu, sigma, xi, kappa):
-        # m = -log(S_F), the GPD-survival exponent, recovered from y = logit(F_ext).
+        # m = -log(1 - H), the GPD-survival exponent, from the carrier inverse
+        # H = F_ext ** (1/kappa) = exp(-a), a = -log(F_ext)/kappa >= 0, and
+        # y = logit(F_ext). So m = -log(1 - exp(-a)) = -log1mexp(-a).
         #
-        # Bulk (value < cutoff): m = -log(1 - F_ext ** (1/kappa)) from log F_ext =
-        # -softplus(-y), via the shared log1mexp inverse so a tiny GPD survival (the
-        # small-kappa regime) is not rounded away to 0. Exact, so it round-trips for
-        # every kappa down to where the carrier underflows (see the class docstring's
-        # kappa note).
+        # Bulk (value < cutoff): a from log F_ext = -softplus(-y); the log1mexp keeps a
+        # tiny GPD survival from rounding to 0 in the small-kappa regime.
         #
-        # Tail (value >= cutoff): log F_ext = -softplus(-y) rounds to 0 once exp(-y)
-        # underflows, sending m -> inf though the quantile is finite. There
-        # S_ext = exp(-t) is tiny (t = softplus(y)) and S_F ~ S_ext / kappa, so
-        #   m -> t + log(kappa) - log(_log1p_div(-exp(-t))),
-        # built without forming exp(-y) before a log, finite until t overflows. The
-        # two branches agree to machine precision at the switch, and both run on
-        # clamped inputs so the discarded one (and its gradient) stays finite.
+        # Tail (value >= cutoff): -softplus(-y) underflows to 0, so carry log(a) instead
+        # of a. With S_ext = exp(-t), t = softplus(y),
+        #   -log(F_ext) = -log1p(-S_ext) = S_ext * _log1p_div(-S_ext),
+        # so log_a = -t + log(_log1p_div(-S_ext)) - log(kappa), finite until t overflows.
+        # m = -log1mexp(-a), with a -> 0 (m ~ -log_a) and a -> inf (m ~ 0) split out so a
+        # itself never over/underflows. Both branches run on clamped inputs so the
+        # discarded one (and its gradient) stays finite.
         #
-        # The crossover is where exp(-y) underflows, which tracks the dtype's exponent
-        # range (~700 for float64, ~80 for float32) -- derive it from finfo rather than
-        # hard-coding 700, which under float32 would route y in ~[80, 700) through the
-        # bulk branch where log F_ext has already underflowed (m -> +inf). float64 is
-        # unchanged: min(700, 708.4 - 8) = 700.
+        # cutoff = where exp(-y) underflows, dtype-aware (~700 float64, ~80 float32);
+        # float64 is min(700, 708.4 - 8) = 700.
         cutoff = np.asarray(
             min(700.0, float(-np.log(np.finfo(value.dtype).tiny)) - 8.0), dtype=value.dtype
         )
         t = pt.softplus(value)
         log_F = -pt.softplus(-pt.minimum(value, cutoff))
         m_bulk = _ext_gpd_excess_from_log_prob(log_F, kappa)
-        s = pt.exp(-pt.maximum(t, cutoff))
-        m_tail = t + pt.log(kappa) - pt.log(_log1p_div(-s))
+        s = pt.exp(-pt.maximum(t, cutoff))  # S_ext, clamped so _log1p_div stays finite
+        log_a = -t + pt.log(_log1p_div(-s)) - pt.log(kappa)
+        a = pt.exp(pt.minimum(log_a, 700.0))
+        m_tail = pt.switch(log_a < -36.0, -log_a, -pt.log1mexp(-a))
         return pt.switch(value < cutoff, m_bulk, m_tail)
 
     @staticmethod
