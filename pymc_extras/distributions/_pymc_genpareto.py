@@ -28,13 +28,7 @@ from pymc.pytensorf import floatX, normalize_rng_param
 from pytensor.tensor.random.basic import uniform
 from pytensor.tensor.random.utils import normalize_size_param
 
-from pymc_extras.distributions._pytensor_genpareto import (
-    _gpd_quantile_from_excess,
-    gen_pareto_icdf,
-    gen_pareto_logccdf,
-    gen_pareto_logcdf,
-    gen_pareto_logp,
-)
+from pymc_extras.distributions import _pytensor_genpareto as genpareto
 
 
 class GenParetoRV(SymbolicRandomVariable):
@@ -54,7 +48,7 @@ class GenParetoRV(SymbolicRandomVariable):
         # Draw the survival probability directly so excess = -log(v) avoids the
         # 1 - u cancellation that hurts the heavy upper tail.
         next_rng, v = uniform(size=size, rng=rng, return_next_rng=True)
-        draws = _gpd_quantile_from_excess(-pt.log(v), mu, sigma, xi)
+        draws = genpareto._gpd_quantile_from_excess(-pt.log(v), mu, sigma, xi)
         return cls(inputs=[rng, size, mu, sigma, xi], outputs=[next_rng, draws])(
             rng, size, mu, sigma, xi
         )
@@ -232,25 +226,23 @@ class GenPareto(Continuous):
         return super().dist([mu, sigma, xi], **kwargs)
 
     def logp(value, mu, sigma, xi):
-        return check_parameters(gen_pareto_logp(value, mu, sigma, xi), sigma > 0, msg="sigma > 0")
+        return check_parameters(genpareto.logpdf(value, mu, sigma, xi), sigma > 0, msg="sigma > 0")
 
     def logcdf(value, mu, sigma, xi):
-        return check_parameters(gen_pareto_logcdf(value, mu, sigma, xi), sigma > 0, msg="sigma > 0")
+        return check_parameters(genpareto.logcdf(value, mu, sigma, xi), sigma > 0, msg="sigma > 0")
 
     def logccdf(value, mu, sigma, xi):
-        return check_parameters(
-            gen_pareto_logccdf(value, mu, sigma, xi), sigma > 0, msg="sigma > 0"
-        )
+        return check_parameters(genpareto.logsf(value, mu, sigma, xi), sigma > 0, msg="sigma > 0")
 
     def icdf(value, mu, sigma, xi):
-        res = gen_pareto_icdf(value, mu, sigma, xi)
+        res = genpareto.ppf(value, mu, sigma, xi)
         res = check_icdf_value(res, value)
         return check_icdf_parameters(res, sigma > 0, msg="sigma > 0")
 
     def support_point(rv, size, mu, sigma, xi):
         # Median: mean is infinite for xi >= 1, so the median is the safe point.
         excess = np.log(2.0)  # -log(1 - 0.5)
-        median = _gpd_quantile_from_excess(excess, mu, sigma, xi)
+        median = genpareto._gpd_quantile_from_excess(excess, mu, sigma, xi)
         if not rv_size_is_none(size):
             median = pt.full(size, median)
         return median
@@ -418,9 +410,9 @@ class _GPDProbabilityIntegralTransform(Transform):
 
 
 class _GenParetoPIT(_GPDProbabilityIntegralTransform):
-    _logp = staticmethod(gen_pareto_logp)
-    _logcdf = staticmethod(gen_pareto_logcdf)
-    _logccdf = staticmethod(gen_pareto_logccdf)
+    _logp = staticmethod(genpareto.logpdf)
+    _logcdf = staticmethod(genpareto.logcdf)
+    _logccdf = staticmethod(genpareto.logsf)
 
     @staticmethod
     def _excess_from_y(value, mu, sigma, xi):
@@ -429,7 +421,7 @@ class _GenParetoPIT(_GPDProbabilityIntegralTransform):
 
     @staticmethod
     def _quantile_from_excess(excess, mu, sigma, xi):
-        return _gpd_quantile_from_excess(excess, mu, sigma, xi)
+        return genpareto._gpd_quantile_from_excess(excess, mu, sigma, xi)
 
 
 @_default_transform.register(GenPareto)

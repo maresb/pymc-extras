@@ -113,7 +113,7 @@ def _in_gpd_support(z, t):
     return pt.and_(z >= 0, 1 + t > 0)
 
 
-def gen_pareto_logp(value, mu, sigma, xi):
+def logpdf(value, mu, sigma, xi):
     """GPD log-density; out-of-support values map to ``-inf``."""
     z = (value - mu) / sigma
     t, log_s = _gpd_tail(z, xi)
@@ -125,7 +125,7 @@ def gen_pareto_logp(value, mu, sigma, xi):
     return logp
 
 
-def gen_pareto_logcdf(value, mu, sigma, xi):
+def logcdf(value, mu, sigma, xi):
     """GPD log-CDF."""
     z = (value - mu) / sigma
     t, _ = _gpd_tail(z, xi)
@@ -139,7 +139,7 @@ def gen_pareto_logcdf(value, mu, sigma, xi):
     return logcdf
 
 
-def gen_pareto_logccdf(value, mu, sigma, xi):
+def logsf(value, mu, sigma, xi):
     """GPD log complementary CDF (log survival function).
 
     The survival exponent ``m`` is computed directly, so it stays exact in the
@@ -157,7 +157,7 @@ def gen_pareto_logccdf(value, mu, sigma, xi):
     return logsf
 
 
-def gen_pareto_icdf(value, mu, sigma, xi):
+def ppf(value, mu, sigma, xi):
     """GPD quantile function (assumes ``0 <= value <= 1``)."""
     value = pt.as_tensor_variable(value)
     excess = -pt.log1p(-value)  # = -log(1 - q) = m

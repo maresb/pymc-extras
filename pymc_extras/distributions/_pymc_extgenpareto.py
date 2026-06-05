@@ -27,20 +27,9 @@ from pymc.pytensorf import floatX, normalize_rng_param
 from pytensor.tensor.random.basic import uniform
 from pytensor.tensor.random.utils import normalize_size_param
 
-from pymc_extras.distributions._pymc_genpareto import (
-    _GPDProbabilityIntegralTransform,
-)
-from pymc_extras.distributions._pytensor_extgenpareto import (
-    _ext_gpd_excess_from_log_prob,
-    ext_gen_pareto_icdf,
-    ext_gen_pareto_logccdf,
-    ext_gen_pareto_logcdf,
-    ext_gen_pareto_logp,
-)
-from pymc_extras.distributions._pytensor_genpareto import (
-    _gpd_quantile_from_excess,
-    _log1p_div,
-)
+from pymc_extras.distributions import _pytensor_extgenpareto as extgenpareto
+from pymc_extras.distributions import _pytensor_genpareto as genpareto
+from pymc_extras.distributions._pymc_genpareto import _GPDProbabilityIntegralTransform
 
 
 class ExtGenParetoRV(SymbolicRandomVariable):
@@ -61,8 +50,8 @@ class ExtGenParetoRV(SymbolicRandomVariable):
         next_rng, u = uniform(size=size, rng=rng, return_next_rng=True)
         # Carrier draw u = F; excess = -log(1 - u ** (1/kappa)), via log1mexp so
         # small-kappa draws do not collapse to the lower endpoint (1 - u**.. -> 1).
-        excess = _ext_gpd_excess_from_log_prob(pt.log(u), kappa)
-        draws = _gpd_quantile_from_excess(excess, mu, sigma, xi)
+        excess = extgenpareto._ext_gpd_excess_from_log_prob(pt.log(u), kappa)
+        draws = genpareto._gpd_quantile_from_excess(excess, mu, sigma, xi)
         return cls(inputs=[rng, size, mu, sigma, xi, kappa], outputs=[next_rng, draws])(
             rng, size, mu, sigma, xi, kappa
         )
@@ -237,7 +226,7 @@ class ExtGenPareto(Continuous):
 
     def logp(value, mu, sigma, xi, kappa):
         return check_parameters(
-            ext_gen_pareto_logp(value, mu, sigma, xi, kappa),
+            extgenpareto.logpdf(value, mu, sigma, xi, kappa),
             sigma > 0,
             kappa > 0,
             msg="sigma > 0, kappa > 0",
@@ -245,7 +234,7 @@ class ExtGenPareto(Continuous):
 
     def logcdf(value, mu, sigma, xi, kappa):
         return check_parameters(
-            ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa),
+            extgenpareto.logcdf(value, mu, sigma, xi, kappa),
             sigma > 0,
             kappa > 0,
             msg="sigma > 0, kappa > 0",
@@ -253,14 +242,14 @@ class ExtGenPareto(Continuous):
 
     def logccdf(value, mu, sigma, xi, kappa):
         return check_parameters(
-            ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa),
+            extgenpareto.logsf(value, mu, sigma, xi, kappa),
             sigma > 0,
             kappa > 0,
             msg="sigma > 0, kappa > 0",
         )
 
     def icdf(value, mu, sigma, xi, kappa):
-        res = ext_gen_pareto_icdf(value, mu, sigma, xi, kappa)
+        res = extgenpareto.ppf(value, mu, sigma, xi, kappa)
         res = check_icdf_value(res, value)
         return check_icdf_parameters(res, sigma > 0, kappa > 0, msg="sigma > 0, kappa > 0")
 
@@ -276,9 +265,9 @@ class ExtGenPareto(Continuous):
         # back to mu in the general representability limit where the support has no
         # distinct interior point (sigma far below ulp(mu), or a sub-ULP bounded
         # support). At kappa = 1 the two coincide, so ordinary kappa is unchanged.
-        excess = _ext_gpd_excess_from_log_prob(np.log(0.5), kappa)
-        median = _gpd_quantile_from_excess(excess, mu, sigma, xi)
-        gpd_median = _gpd_quantile_from_excess(np.log(2.0), mu, sigma, xi)
+        excess = extgenpareto._ext_gpd_excess_from_log_prob(np.log(0.5), kappa)
+        median = genpareto._gpd_quantile_from_excess(excess, mu, sigma, xi)
+        gpd_median = genpareto._gpd_quantile_from_excess(np.log(2.0), mu, sigma, xi)
         point = pt.switch(pt.le(median, mu), gpd_median, median)
         if not rv_size_is_none(size):
             point = pt.full(size, point)
@@ -286,9 +275,9 @@ class ExtGenPareto(Continuous):
 
 
 class _ExtGenParetoPIT(_GPDProbabilityIntegralTransform):
-    _logp = staticmethod(ext_gen_pareto_logp)
-    _logcdf = staticmethod(ext_gen_pareto_logcdf)
-    _logccdf = staticmethod(ext_gen_pareto_logccdf)
+    _logp = staticmethod(extgenpareto.logpdf)
+    _logcdf = staticmethod(extgenpareto.logcdf)
+    _logccdf = staticmethod(extgenpareto.logsf)
 
     @staticmethod
     def _excess_from_y(value, mu, sigma, xi, kappa):
@@ -301,8 +290,8 @@ class _ExtGenParetoPIT(_GPDProbabilityIntegralTransform):
         #
         # Tail (value >= cutoff): -softplus(-y) underflows to 0, so carry log(a) instead
         # of a. With S_ext = exp(-t), t = softplus(y),
-        #   -log(F_ext) = -log1p(-S_ext) = S_ext * _log1p_div(-S_ext),
-        # so log_a = -t + log(_log1p_div(-S_ext)) - log(kappa), finite until t overflows.
+        #   -log(F_ext) = -log1p(-S_ext) = S_ext * genpareto._log1p_div(-S_ext),
+        # so log_a = -t + log(genpareto._log1p_div(-S_ext)) - log(kappa), finite until t overflows.
         # m = -log1mexp(-a), with a -> 0 (m ~ -log_a) and a -> inf (m ~ 0) split out so a
         # itself never over/underflows. Both branches run on clamped inputs so the
         # discarded one (and its gradient) stays finite.
@@ -314,16 +303,16 @@ class _ExtGenParetoPIT(_GPDProbabilityIntegralTransform):
         )
         t = pt.softplus(value)
         log_F = -pt.softplus(-pt.minimum(value, cutoff))
-        m_bulk = _ext_gpd_excess_from_log_prob(log_F, kappa)
-        s = pt.exp(-pt.maximum(t, cutoff))  # S_ext, clamped so _log1p_div stays finite
-        log_a = -t + pt.log(_log1p_div(-s)) - pt.log(kappa)
+        m_bulk = extgenpareto._ext_gpd_excess_from_log_prob(log_F, kappa)
+        s = pt.exp(-pt.maximum(t, cutoff))  # S_ext, clamped so genpareto._log1p_div stays finite
+        log_a = -t + pt.log(genpareto._log1p_div(-s)) - pt.log(kappa)
         a = pt.exp(pt.minimum(log_a, 700.0))
         m_tail = pt.switch(log_a < -36.0, -log_a, -pt.log1mexp(-a))
         return pt.switch(value < cutoff, m_bulk, m_tail)
 
     @staticmethod
     def _quantile_from_excess(excess, mu, sigma, xi, kappa):
-        return _gpd_quantile_from_excess(excess, mu, sigma, xi)
+        return genpareto._gpd_quantile_from_excess(excess, mu, sigma, xi)
 
 
 @_default_transform.register(ExtGenPareto)

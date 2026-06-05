@@ -31,7 +31,7 @@ from pymc_extras.distributions._pytensor_genpareto import (
 # kappa = 1 recovers the plain GPD.
 
 
-def ext_gen_pareto_logp(value, mu, sigma, xi, kappa):
+def logpdf(value, mu, sigma, xi, kappa):
     """Extended-GPD log-density; out-of-support values map to ``-inf``."""
     z = (value - mu) / sigma
     t, log_s = _gpd_tail(z, xi)
@@ -45,7 +45,7 @@ def ext_gen_pareto_logp(value, mu, sigma, xi, kappa):
     return logp
 
 
-def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
+def logcdf(value, mu, sigma, xi, kappa):
     """Extended-GPD log-CDF."""
     z = (value - mu) / sigma
     t, _ = _gpd_tail(z, xi)
@@ -56,7 +56,7 @@ def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
     return logcdf
 
 
-def ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa):
+def logsf(value, mu, sigma, xi, kappa):
     """Extended-GPD log complementary CDF (log survival function).
 
     ``S = 1 - H ** kappa``, with ``a = log(1 - H) = -m`` the GPD log survival
@@ -121,7 +121,7 @@ def _ext_gpd_excess_from_log_prob(log_q, kappa):
     return -pt.log1mexp(log_q / kappa)
 
 
-def ext_gen_pareto_icdf(value, mu, sigma, xi, kappa):
+def ppf(value, mu, sigma, xi, kappa):
     """Extended-GPD quantile function (assumes ``0 <= value <= 1``)."""
     value = pt.as_tensor_variable(value)
     # F = H ** kappa = q  ->  H = q ** (1/kappa); excess m = -log(1 - H), built
