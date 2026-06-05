@@ -289,20 +289,13 @@ class _GPDProbabilityIntegralTransform(Transform):
         params = inputs[2:]
         x = self.backward(value, *inputs)
         finfo = np.finfo(value.dtype)
-        # The PIT makes the transformed density exactly Logistic(value): with F(x) =
-        # sigmoid(value), log f_x(x) + log|dx/dy| = -softplus(value) - softplus(-value).
-        # Return that minus logp(x); the framework adds logp(backward(value)) back, so
-        # the two cancel to the Logistic log-density. Where |logp(x)| is large enough
-        # that the cancellation would lose the O(1) residue (the unreachable upper
-        # saturation, the sigma << ulp(mu) near-delta), return -inf instead.
+        # PIT density is exactly Logistic(value); since the framework adds logp(x)
+        # back, return logistic - logp(x). Where |logp(x)| is too large for that to
+        # keep the O(1) residue (deep-tail / near-delta saturation), reject with -inf.
         logistic = -pt.softplus(value) - pt.softplus(-value)
         logp_x = self._logp(x, *params)
         unrepresentable = pt.abs(logp_x) > 1.0 / np.sqrt(finfo.eps)
-        jac = pt.switch(unrepresentable, -np.inf, logistic - logp_x)
-        # If logp_x is NaN, route through a constant branch so the rewrite optimizer
-        # cannot algebraically cancel this jac's -logp_x against the framework's
-        # +logp(backward) into a spurious finite Logistic.
-        return pt.switch(pt.isnan(logp_x), np.nan, jac)
+        return pt.switch(unrepresentable, -np.inf, logistic - logp_x)
 
 
 class _GenParetoPIT(_GPDProbabilityIntegralTransform):
