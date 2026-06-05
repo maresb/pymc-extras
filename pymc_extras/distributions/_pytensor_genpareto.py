@@ -83,26 +83,6 @@ def _expm1_div(u: TensorVariable) -> TensorVariable:
 # All three reduce to the exponential law as xi -> 0 (m -> z).
 
 
-def _safe_mul(a, b):
-    """``a * b``, repairing ONLY the indeterminate ``0 * inf`` to ``0``.
-
-    Only ``xi * z`` needs this: at ``xi = 0`` with an infinite observation the
-    product is mathematically ``0`` (the exponential GPD carries no shape term),
-    but ``0.0 * inf`` is ``nan`` under IEEE, and a ``nan`` in the unused branch of
-    a ``switch`` can still leak (the backend may lower it to ``cond*a + ...``).
-
-    The repair is restricted to the exact ``{0} x {+-inf}`` cases so that a
-    genuine ``nan`` in ``a`` or ``b`` (e.g. ``xi = nan`` from bad input) still
-    propagates instead of being silently turned into the ``xi = 0`` branch.
-    """
-    prod = a * b
-    zero_times_inf = pt.or_(
-        pt.and_(pt.eq(a, 0), pt.isinf(b)),
-        pt.and_(pt.eq(b, 0), pt.isinf(a)),
-    )
-    return pt.switch(zero_times_inf, 0.0, prod)
-
-
 def _gpd_tail(z, xi):
     """``(t, log_s)`` for ``t = xi * z`` and ``log_s = log(1 + xi * z)``.
 
@@ -116,7 +96,7 @@ def _gpd_tail(z, xi):
     gone and no rearrangement here recovers them); see the class precision note and
     the margin-aware entry points for boundary-critical callers.
     """
-    t = _safe_mul(xi, z)
+    t = xi * z
     return t, pt.log1p(t)
 
 

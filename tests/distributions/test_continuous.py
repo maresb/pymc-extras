@@ -590,8 +590,8 @@ class TestGenParetoBoundaries:
 
     def test_logp_logcdf_at_infinity(self):
         # density at +inf is 0 (logp -inf); CDF at +inf is 1 (logcdf 0). The
-        # xi=0 path is the delicate one: xi*inf is nan without _safe_mul. Batch the
-        # three xi into one dist so each method compiles once, not once per xi.
+        # xi=0 path is the delicate one: 0*inf is nan, so the +inf tail is pinned
+        # explicitly. Batch the three xi into one dist so each method compiles once.
         xi = np.array([-0.5, 0.0, 0.5])
         for dist in (
             GenPareto.dist(mu=0.0, sigma=1.0, xi=xi),
