@@ -45,11 +45,9 @@ from scipy import stats
 
 # the distributions to be tested
 from pymc_extras.distributions import Chi, ExtGenPareto, GenExtreme, GenPareto, Maxwell
-from pymc_extras.distributions.continuous import (
-    _ExtGenParetoPIT,
-    ext_gen_pareto_logp,
-    gen_pareto_logp,
-)
+from pymc_extras.distributions._pymc_extgenpareto import _ExtGenParetoPIT
+from pymc_extras.distributions._pytensor_extgenpareto import ext_gen_pareto_logp
+from pymc_extras.distributions._pytensor_genpareto import gen_pareto_logp
 
 pytestmark = pytest.mark.filterwarnings(
     "ignore:Numba will use object mode to run Generalized Extreme Value:UserWarning"
