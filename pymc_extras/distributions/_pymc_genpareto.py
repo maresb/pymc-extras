@@ -143,36 +143,23 @@ class GenPareto(Continuous):
 
     **Numerical precision near the** :math:`\xi < 0` **wall.** The family is built
     on :math:`s = 1 + \xi (x - \mu)/\sigma`, which cancels toward :math:`0` as
-    :math:`x \to x_F^-`. The log-density *value* keeps near-machine relative
-    accuracy there (it is :math:`\sim |1 + 1/\xi|\,\log s`, large in magnitude),
-    but its gradient with respect to :math:`\sigma` and :math:`\xi` contains
-    :math:`\sim z/s` terms that inherit the lost low bits of :math:`s` and are
-    accurate only to a *relative* :math:`\sim \varepsilon/s` (about 3 significant
-    figures once :math:`x` is within :math:`\sim 10^{-13}` of the wall). This is a
-    representability limit of the float64 *input* :math:`x` -- once it is within a
-    few ULP of :math:`x_F` the low bits of :math:`s` are already gone and no
-    rearrangement of ``logp(x, ...)`` recovers them. A model that can form the
-    margin :math:`s` directly without computing :math:`1 + \xi z` -- e.g. a
-    peaks-over-threshold model that knows the wall exactly -- avoids the loss, so
-    gradient-critical callers working right at the boundary should parameterize in
-    terms of that margin.
+    :math:`x \to x_F^-`. The log-density value stays accurate there, but its
+    gradient w.r.t. :math:`\sigma` and :math:`\xi` carries :math:`\sim z/s` terms
+    accurate only to :math:`\sim \varepsilon/s` (about 3 figures within
+    :math:`\sim 10^{-13}` of the wall) -- a representability limit of the float64
+    input :math:`x` that no rearrangement of ``logp`` recovers. A model that forms
+    the margin :math:`s` directly avoids the loss.
 
     Examples
     --------
-    Fitting exceedances over a known threshold. The observations must lie inside
-    the support :math:`[\mu,\ \mu - \sigma/\xi]`; for :math:`\xi < 0` the binding
-    constraint is the upper wall, ``max(data) < mu - sigma/xi``, which rearranges to
-    a *lower* bound on the shape, ``xi > -sigma / (max(data) - mu)`` (there is no
-    upper bound -- :math:`\xi \geq 0` is an unbounded tail that always contains the
-    data). The shape is *also* floored at ``xi > -1``: for :math:`\xi < -1` the
-    density diverges at the upper endpoint, making the likelihood unbounded (an
-    improper posterior NUTS runs away to) -- ``xi > -1`` is the usual regularity
-    condition. Encoding both as the lower bound of an otherwise broad prior on
-    :math:`\xi` lets NUTS sample the whole shape range -- bounded and unbounded
-    tails alike -- without the support-wall divergences a free ``(sigma, xi)`` pair
-    suffers: the transform stretches the wall to infinity in the unconstrained
-    space. (Naming the GPD parameters ``pareto_*`` keeps them distinct from the
-    ``mu`` / ``sigma`` *of the prior distributions*.)
+    Fitting exceedances over a known threshold. The data must lie in the support
+    :math:`[\mu,\ \mu - \sigma/\xi]`; for :math:`\xi < 0` that is the upper wall
+    ``max(data) < mu - sigma/xi``, i.e. a lower bound ``xi > -sigma/(max(data) - mu)``
+    (there is no upper bound -- :math:`\xi \geq 0` always contains the data). Floor
+    :math:`\xi` at ``-1`` as well: for :math:`\xi < -1` the density diverges at the
+    upper endpoint (unbounded likelihood). Encoding both as the lower bound of a
+    broad :math:`\xi` prior lets NUTS sample the whole shape range without the
+    support-wall divergences a free ``(sigma, xi)`` pair suffers.
 
     .. code-block:: python
 
@@ -206,12 +193,10 @@ class GenPareto(Continuous):
     wall noted above (reached only when the wall is pinned within ``~1e-13`` of the
     data).
 
-    The threshold ``mu`` is held fixed -- the standard peaks-over-threshold setup,
-    and load-bearing: a *free* ``mu`` makes the likelihood unbounded. For the GPD
-    this is the classic three-parameter pathology -- ``mu`` slides onto
-    ``min(data)`` while ``sigma -> 0``, which diverges once ``xi > n - 1`` (a heavy
-    tail relative to the sample size, so usually only reachable for tiny samples).
-    For :class:`ExtGenPareto` it is far easier to hit (``mu -> min(data)`` alone, for
+    Keep ``mu`` fixed (the standard peaks-over-threshold setup). A free ``mu``
+    makes the likelihood unbounded: it slides onto ``min(data)`` as ``sigma -> 0``,
+    which diverges once ``xi > n - 1`` (usually only for tiny samples).
+    :class:`ExtGenPareto` hits this far more easily (``mu -> min(data)`` alone, for
     any ``kappa < 1``); see its Examples.
     """
 
