@@ -32,7 +32,7 @@ from pymc_extras.distributions._pytensor_genpareto import (
 
 
 def ext_gen_pareto_logp(value, mu, sigma, xi, kappa):
-    """Pure-PyTensor extended-GPD log-density; out-of-support values map to ``-inf``."""
+    """Extended-GPD log-density; out-of-support values map to ``-inf``."""
     z = (value - mu) / sigma
     t, log_s = _gpd_tail(z, xi)
     # log g = log kappa + (kappa - 1) log H + log h. The carrier term vanishes
@@ -46,7 +46,7 @@ def ext_gen_pareto_logp(value, mu, sigma, xi, kappa):
 
 
 def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
-    """Pure-PyTensor extended-GPD log-CDF."""
+    """Extended-GPD log-CDF."""
     z = (value - mu) / sigma
     t, _ = _gpd_tail(z, xi)
     above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + t, 0))
@@ -57,7 +57,7 @@ def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
 
 
 def ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa):
-    """Pure-PyTensor extended-GPD log complementary CDF (log survival function).
+    """Extended-GPD log complementary CDF (log survival function).
 
     ``S = 1 - H ** kappa``, with ``a = log(1 - H) = -m`` the GPD log survival
     (exact in the tail) and ``s = S_gpd = exp(a)``. The generic
@@ -122,7 +122,7 @@ def _ext_gpd_excess_from_log_prob(log_q, kappa):
 
 
 def ext_gen_pareto_icdf(value, mu, sigma, xi, kappa):
-    """Pure-PyTensor extended-GPD quantile function (assumes ``0 <= value <= 1``)."""
+    """Extended-GPD quantile function (assumes ``0 <= value <= 1``)."""
     value = pt.as_tensor_variable(value)
     # F = H ** kappa = q  ->  H = q ** (1/kappa); excess m = -log(1 - H), built
     # with log1mexp so a tiny 1 - H (small kappa) is not rounded away to 0.

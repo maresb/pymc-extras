@@ -62,17 +62,12 @@ def _expm1_div(u: TensorVariable) -> TensorVariable:
 
 
 def _gpd_tail(z, xi):
-    """``(t, log_s)`` for ``t = xi * z`` and ``log_s = log(1 + xi * z)``.
+    """``(t, log_s) = (xi * z, log(1 + xi * z))``, formed once per call.
 
-    ``s = 1 + xi * z`` is the *only* place the observation enters the GPD family --
-    the log-density, survival, CDF and support mask are all functions of it -- so
-    every builder forms it here, exactly once per call, and reuses the pair. That
-    keeps the one unavoidable precision loss from being re-derived inconsistently:
-    as ``value`` approaches the ``xi < 0`` upper wall ``mu - sigma/xi``, ``t -> -1``
-    and ``s = 1 + t`` cancels catastrophically. That loss is in the *inputs* (once
-    ``value`` is within a few ULP of the wall the low bits of ``s`` are already
-    gone and no rearrangement here recovers them); see the class precision note and
-    the margin-aware entry points for boundary-critical callers.
+    ``s = 1 + xi * z`` is the only place the observation enters the family; it
+    cancels catastrophically as ``value`` nears the ``xi < 0`` upper wall
+    ``mu - sigma/xi`` -- a precision loss in the input that no rearrangement
+    here recovers.
     """
     t = xi * z
     return t, pt.log1p(t)
@@ -114,16 +109,12 @@ def _gpd_upper_bound(mu, sigma, xi):
 
 
 def _in_gpd_support(z, t):
-    """Boolean mask of the GPD support: z >= 0 and (for xi < 0) z <= -1/xi.
-
-    ``t = xi * z``; the upper edge is ``s = 1 + t > 0`` (the same ``t`` the density
-    is built from, so the mask and the value never disagree at the wall).
-    """
+    """GPD support mask: ``z >= 0`` and (for ``xi < 0``) ``s = 1 + t > 0``."""
     return pt.and_(z >= 0, 1 + t > 0)
 
 
 def gen_pareto_logp(value, mu, sigma, xi):
-    """Pure-PyTensor GPD log-density; out-of-support values map to ``-inf``."""
+    """GPD log-density; out-of-support values map to ``-inf``."""
     z = (value - mu) / sigma
     t, log_s = _gpd_tail(z, xi)
     logp = pt.switch(_in_gpd_support(z, t), _gpd_log_h(z, sigma, t, log_s), -np.inf)
@@ -135,7 +126,7 @@ def gen_pareto_logp(value, mu, sigma, xi):
 
 
 def gen_pareto_logcdf(value, mu, sigma, xi):
-    """Pure-PyTensor GPD log-CDF."""
+    """GPD log-CDF."""
     z = (value - mu) / sigma
     t, _ = _gpd_tail(z, xi)
     # Three regions: below mu -> 0 (log -inf); for xi < 0 past the finite upper
@@ -149,12 +140,11 @@ def gen_pareto_logcdf(value, mu, sigma, xi):
 
 
 def gen_pareto_logccdf(value, mu, sigma, xi):
-    """Pure-PyTensor GPD log complementary CDF (log survival function).
+    """GPD log complementary CDF (log survival function).
 
-    The survival exponent ``m`` is computed directly, so this is exact and stable
-    in the heavy upper tail -- the regime where the generic
-    ``log1mexp(logcdf)`` fallback collapses (``logcdf -> 0`` there). This is the
-    natural ``logsf`` primitive for a peaks-over-threshold model.
+    The survival exponent ``m`` is computed directly, so it stays exact in the
+    heavy upper tail where the generic ``log1mexp(logcdf)`` fallback collapses
+    (``logcdf -> 0`` there).
     """
     z = (value - mu) / sigma
     t, _ = _gpd_tail(z, xi)
@@ -168,7 +158,7 @@ def gen_pareto_logccdf(value, mu, sigma, xi):
 
 
 def gen_pareto_icdf(value, mu, sigma, xi):
-    """Pure-PyTensor GPD quantile function (assumes ``0 <= value <= 1``)."""
+    """GPD quantile function (assumes ``0 <= value <= 1``)."""
     value = pt.as_tensor_variable(value)
     excess = -pt.log1p(-value)  # = -log(1 - q) = m
     x = _gpd_quantile_from_excess(excess, mu, sigma, xi)
