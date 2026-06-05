@@ -144,25 +144,6 @@ def _in_gpd_support(z, t):
     return pt.and_(z >= 0, 1 + t > 0)
 
 
-def _propagate_nonfinite_shape(result, xi, kappa=None):
-    """Map ``result`` to ``nan`` wherever a shape parameter is non-finite.
-
-    The support / boundary ``switch`` masks below mask out-of-support values to
-    ``-inf`` / ``0``; without this a non-finite shape would be silently turned
-    into one of those ("valid parameter, impossible value", which is a lie).
-    Keyed on ``isfinite(xi)`` directly -- not on ``1 + xi z`` -- so it fires for
-    ``xi = nan`` and ``xi = +-inf`` at *every* value, including ``x = mu`` (where
-    ``z = 0`` makes ``1 + xi z`` finite). ``nan``/``inf`` shape in -> ``nan`` out,
-    consistently across logp / logcdf / logccdf. For the extended family ``kappa``
-    is checked the same way (a non-finite ``kappa`` passes ``kappa > 0`` but would
-    otherwise leak inconsistent ``nan`` / ``-inf`` / ``0`` across the three).
-    """
-    result = pt.switch(pt.isfinite(xi), result, np.nan)
-    if kappa is not None:
-        result = pt.switch(pt.isfinite(kappa), result, np.nan)
-    return result
-
-
 # The ``gen_pareto_*`` / ``ext_gen_pareto_*`` builders below are pure PyTensor:
 # they assemble the masked log-density / log-CDF / quantile graphs and call NO
 # PyMC parameter check, which keeps them portable (the math can be reused
@@ -179,7 +160,7 @@ def gen_pareto_logp(value, mu, sigma, xi):
     # in-support branch would evaluate log1p(inf)/inf -> nan there, so pin
     # z = +inf to -inf explicitly.
     logp = pt.switch(pt.eq(z, np.inf), -np.inf, logp)
-    return _propagate_nonfinite_shape(logp, xi)
+    return logp
 
 
 def gen_pareto_logcdf(value, mu, sigma, xi):
@@ -193,7 +174,7 @@ def gen_pareto_logcdf(value, mu, sigma, xi):
     logcdf = pt.switch(z >= 0, logcdf, -np.inf)
     # CDF -> 1 (logcdf 0) at the +inf tail; for xi > 0 _gpd_log_H(inf) is nan.
     logcdf = pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
-    return _propagate_nonfinite_shape(logcdf, xi)
+    return logcdf
 
 
 def gen_pareto_logccdf(value, mu, sigma, xi):
@@ -212,7 +193,7 @@ def gen_pareto_logccdf(value, mu, sigma, xi):
     logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
     # Below mu the survival is 1 (logsf 0).
     logsf = pt.switch(z < 0, 0.0, logsf)
-    return _propagate_nonfinite_shape(logsf, xi)
+    return logsf
 
 
 def gen_pareto_icdf(value, mu, sigma, xi):
@@ -224,6 +205,4 @@ def gen_pareto_icdf(value, mu, sigma, xi):
     # Without this, q=1 with xi<0 is ``inf * 0 = nan`` rather than ``mu - sigma/xi``.
     x = pt.switch(pt.eq(value, 1), _gpd_upper_bound(mu, sigma, xi), x)
     x = pt.switch(pt.eq(value, 0), mu, x)
-    # The endpoint switches above would otherwise hand back mu / the upper bound even
-    # for a non-finite xi; propagate NaN so q = 0 / 1 agree with the interior.
-    return _propagate_nonfinite_shape(x, xi)
+    return x

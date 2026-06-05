@@ -23,7 +23,6 @@ from pymc_extras.distributions._pytensor_genpareto import (
     _gpd_tail,
     _gpd_upper_bound,
     _in_gpd_support,
-    _propagate_nonfinite_shape,
 )
 
 # Extended Generalized Pareto core. Naveau et al. (2016) extended GPD with
@@ -43,7 +42,7 @@ def ext_gen_pareto_logp(value, mu, sigma, xi, kappa):
     logp = pt.log(kappa) + carrier + _gpd_log_h(z, sigma, t, log_s)
     logp = pt.switch(_in_gpd_support(z, t), logp, -np.inf)
     logp = pt.switch(pt.eq(z, np.inf), -np.inf, logp)
-    return _propagate_nonfinite_shape(logp, xi, kappa)
+    return logp
 
 
 def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
@@ -54,7 +53,7 @@ def ext_gen_pareto_logcdf(value, mu, sigma, xi, kappa):
     logcdf = pt.switch(above_upper, 0.0, kappa * _gpd_log_H(z, t))
     logcdf = pt.switch(z >= 0, logcdf, -np.inf)
     logcdf = pt.switch(pt.eq(z, np.inf), 0.0, logcdf)
-    return _propagate_nonfinite_shape(logcdf, xi, kappa)
+    return logcdf
 
 
 def ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa):
@@ -104,7 +103,7 @@ def ext_gen_pareto_logccdf(value, mu, sigma, xi, kappa):
     above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + t, 0))
     logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
     logsf = pt.switch(z < 0, 0.0, logsf)
-    return _propagate_nonfinite_shape(logsf, xi, kappa)
+    return logsf
 
 
 def _ext_gpd_excess_from_log_prob(log_q, kappa):
@@ -131,6 +130,4 @@ def ext_gen_pareto_icdf(value, mu, sigma, xi, kappa):
     x = _gpd_quantile_from_excess(excess, mu, sigma, xi)
     x = pt.switch(pt.eq(value, 1), _gpd_upper_bound(mu, sigma, xi), x)
     x = pt.switch(pt.eq(value, 0), mu, x)
-    # As in the GPD quantile: the q = 0 / 1 endpoints must also propagate a non-finite
-    # shape (xi or kappa) as NaN rather than returning mu / the upper bound.
-    return _propagate_nonfinite_shape(x, xi, kappa)
+    return x

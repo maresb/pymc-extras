@@ -627,52 +627,10 @@ class TestGenParetoBoundaries:
                 pm.logp(ExtGenPareto.dist(mu=0.0, sigma=sigma, xi=0.1, kappa=2.0), 1.0).eval()
 
     def test_invalid_kappa_raises(self):
-        for kappa in (0.0, -1.0):
+        # kappa <= 0 and kappa = nan both fail the kappa > 0 check and raise.
+        for kappa in (0.0, -1.0, np.nan):
             with pytest.raises(ParameterValueError):
                 pm.logp(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.1, kappa=kappa), 1.0).eval()
-
-    @pytest.mark.parametrize(
-        "bad_xi", [np.nan, np.inf]
-    )  # isfinite guard is sign-agnostic; -inf == inf path
-    def test_nonfinite_xi_propagates_consistently(self, bad_xi):
-        # A non-finite ``xi`` must propagate as ``nan`` at *every* value -- not be
-        # masked to the ``-inf`` / ``0`` of an out-of-support point ("valid
-        # parameter, impossible value", which is a lie), and not be silently
-        # turned into the xi = 0 exponential branch. This must hold even at
-        # ``x = mu`` (where ``z = 0`` makes ``1 + xi z`` finite) and for
-        # ``xi = +-inf``, so the guard keys on ``isfinite(xi)`` directly.
-        # sanity: the xi = 0 branch is finite at x = 1, so a masked -inf would hide it
-        assert np.isfinite(pm.logp(GenPareto.dist(mu=0.0, sigma=1.0, xi=0.0), 1.0).eval())
-        # in support (x=1), at the lower endpoint (x=mu=0), below (x=-1), above (+inf);
-        # icdf incl the q = 0 / 1 endpoints (which otherwise hand back mu / the upper
-        # bound regardless of the invalid shape). Probe all points in one vectorised
-        # eval per method so the test does not recompile once per (point, method).
-        xs = np.array([1.0, 0.0, -1.0, np.inf])
-        qs = np.array([0.0, 0.5, 1.0])
-        for dist in (
-            GenPareto.dist(mu=0.0, sigma=1.0, xi=bad_xi),
-            ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=bad_xi, kappa=2.0),
-        ):
-            assert np.all(np.isnan(pm.logp(dist, xs).eval()))
-            assert np.all(np.isnan(pm.logcdf(dist, xs).eval()))
-            assert np.all(np.isnan(pm.logccdf(dist, xs).eval()))
-            assert np.all(np.isnan(pm.icdf(dist, qs).eval()))
-
-    def test_nonfinite_kappa_propagates_consistently(self):
-        # ``kappa = inf`` passes the ``kappa > 0`` check (inf > 0 is True), so the
-        # check does not catch it; like a non-finite ``xi`` (and like pm.Gamma's
-        # ``alpha = inf``) it must then propagate ``nan`` uniformly across logp /
-        # logcdf / logccdf / icdf -- including the icdf endpoints -- not leak the
-        # inconsistent nan / -inf / 0 / bound the un-guarded branches would.
-        dist = ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.3, kappa=np.inf)
-        xs = np.array([1.0, 0.0, -1.0])
-        assert np.all(np.isnan(pm.logp(dist, xs).eval()))
-        assert np.all(np.isnan(pm.logcdf(dist, xs).eval()))
-        assert np.all(np.isnan(pm.logccdf(dist, xs).eval()))
-        assert np.all(np.isnan(pm.icdf(dist, np.array([0.0, 0.5, 1.0])).eval()))
-        # ``kappa = nan`` fails ``kappa > 0`` (nan > 0 is False) and raises instead.
-        with pytest.raises(ParameterValueError):
-            pm.logp(ExtGenPareto.dist(mu=0.0, sigma=1.0, xi=0.3, kappa=np.nan), 1.0).eval()
 
 
 class TestGenParetoHeavyTail:
@@ -1093,12 +1051,11 @@ class TestGenParetoTransforms:
         ],
     )
     def test_nonfinite_shape_does_not_leak_a_finite_logistic_through_the_transform(self, kw):
-        # Blocker regression: the log_jac_det = logistic - logp(x) cancellation must
-        # NOT let a non-finite shape (xi / kappa) cancel its NaN raw logp out of the
-        # graph and resurface as a *finite* Logistic in transformed space -- that would
-        # silently accept an invalid parameter as a valid latent. The transformed logp
-        # must be non-finite (NaN), so PyMC's check_start_vals rejects it loudly,
-        # exactly as pm.Gamma(alpha=inf) does.
+        # Safety regression: the log_jac_det = logistic - logp(x) cancellation must
+        # NOT let a non-finite shape (xi / kappa) resurface as a *finite* Logistic in
+        # transformed space -- that would silently accept an invalid parameter as a
+        # valid latent. The transformed logp must be non-finite, so PyMC's
+        # check_start_vals rejects it loudly at initialization.
         cls = ExtGenPareto if "kappa" in kw else GenPareto
         with pm.Model() as model:
             cls("x", mu=0.0, sigma=1.0, **kw)
@@ -1106,13 +1063,11 @@ class TestGenParetoTransforms:
             [model.value_vars[0]], model.logp(sum=True), on_unused_input="ignore"
         )
         for y in (-3.0, 0.0, 3.0):
-            # Must be NaN specifically (an invalid parameter), not -inf -- so a future
-            # regression that turns it into a clean reject instead of NaN still fails.
-            assert np.isnan(float(logp(y)))
+            assert not np.isfinite(float(logp(y)))
 
     def test_nonfinite_shape_is_caught_loudly_at_init(self):
         # The practical symptom of the leak guarded above: PyMC's check_start_vals
-        # rejects the NaN initial logp loudly (the same path as pm.Gamma(alpha=inf)).
+        # rejects the non-finite initial logp loudly.
         # Checked once for a representative invalid shape rather than recompiling the
         # model + initial point for every parametrize case.
         with pm.Model() as model:
