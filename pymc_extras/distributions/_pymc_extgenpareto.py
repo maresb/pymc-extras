@@ -275,6 +275,8 @@ class ExtGenPareto(Continuous):
 
 
 class _ExtGenParetoPIT(_GPDProbabilityIntegralTransform):
+    """PIT transform for :class:`ExtGenPareto` (carrier inverse in ``_excess_from_y``)."""
+
     _logp = staticmethod(extgenpareto.logpdf)
     _logcdf = staticmethod(extgenpareto.logcdf)
     _logccdf = staticmethod(extgenpareto.logsf)

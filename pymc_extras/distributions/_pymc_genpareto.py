@@ -321,6 +321,8 @@ class _GPDProbabilityIntegralTransform(Transform):
 
 
 class _GenParetoPIT(_GPDProbabilityIntegralTransform):
+    """PIT transform for :class:`GenPareto`."""
+
     _logp = staticmethod(genpareto.logpdf)
     _logcdf = staticmethod(genpareto.logcdf)
     _logccdf = staticmethod(genpareto.logsf)
