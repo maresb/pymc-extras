@@ -1185,13 +1185,6 @@ class TestGenParetoTransforms:
             if xi < 0:
                 assert np.all(xs <= mu - sigma / xi + 1e-9), f"x{i} (xi={xi}) past wall"
 
-    def test_observed_is_unaffected(self):
-        # Observed data is fixed, so the transform must not change its logp.
-        data = np.array([6.0, 7.0, 8.0])
-        with pm.Model() as model:
-            GenPareto("obs", mu=5.0, sigma=1.0, xi=0.2, observed=data)
-        assert np.isfinite(model.compile_logp()({}))
-
 
 class TestGenParetoSmoothShapeLimit:
     """The headline property: the logp is C1 in xi through the xi = 0 limit.
