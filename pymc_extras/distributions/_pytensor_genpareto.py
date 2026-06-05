@@ -17,28 +17,6 @@ import pytensor.tensor as pt
 
 from pytensor.tensor.variable import TensorVariable
 
-# ===========================================================================
-# Generalized Pareto family (GenPareto, ExtGenPareto)
-# ===========================================================================
-# These two distributions are built in three layers, top to bottom:
-#
-# 1. Pure PyTensor math kernels (``gen_pareto_logp`` / ``_logcdf`` / ``_icdf``
-#    and the extended-family variants), depending only on ``pytensor``. These
-#    math kernels are portable -- they can be dropped into another library such
-#    as ``pytensor-distributions`` -- but they are only the density/CDF/quantile
-#    expressions, not the full functional API (pdf, sf, isf, rvs, moments, ...).
-# 2. ``SymbolicRandomVariable`` Ops that sample by inverse-CDF on a uniform
-#    draw, so the random methods work on every backend (C, Numba, JAX) without
-#    a SciPy object-mode fallback.
-# 3. Thin ``Continuous`` distribution classes wiring the two together.
-#
-# The ``xi -> 0`` limit (where the heavy-tailed GPD collapses to the
-# exponential) is handled with C1-smooth ``log1p(u)/u`` and ``expm1(u)/u``
-# helpers rather than a ``switch(isclose(xi, 0), ...)`` branch: the naive branch
-# leaves a gradient kink at ``xi = 0`` that drives NUTS divergences, while
-# routing the whole family through ``m = log1p(xi z) / xi`` keeps both the value
-# and its gradient continuous through the limit.
-
 
 def _series_cutoff(dtype) -> float:
     """``|u|`` below which the divided-difference helpers switch to their series.
