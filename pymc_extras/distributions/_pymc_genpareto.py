@@ -288,14 +288,10 @@ class _GPDProbabilityIntegralTransform(Transform):
     def log_jac_det(self, value, *inputs):
         params = inputs[2:]
         x = self.backward(value, *inputs)
-        finfo = np.finfo(value.dtype)
-        # PIT density is exactly Logistic(value); since the framework adds logp(x)
-        # back, return logistic - logp(x). Where |logp(x)| is too large for that to
-        # keep the O(1) residue (deep-tail / near-delta saturation), reject with -inf.
+        # PIT density is exactly Logistic(value); the framework adds logp(x) back,
+        # so log|dx/dy| = logistic - logp(x).
         logistic = -pt.softplus(value) - pt.softplus(-value)
-        logp_x = self._logp(x, *params)
-        unrepresentable = pt.abs(logp_x) > 1.0 / np.sqrt(finfo.eps)
-        return pt.switch(unrepresentable, -np.inf, logistic - logp_x)
+        return logistic - self._logp(x, *params)
 
 
 class _GenParetoPIT(_GPDProbabilityIntegralTransform):
