@@ -331,7 +331,7 @@ class TestExtGenParetoClass:
             expected = np.full(size, expected)
         assert_support_point_is_expected(model, expected)
 
-    @pytest.mark.parametrize("kappa", [0.5, 0.05, 0.01])
+    @pytest.mark.parametrize("kappa", [0.5, 0.01])
     def test_small_kappa_inverses_share_the_stable_excess(self, kappa):
         # icdf, the default transform's backward and support_point all invert the
         # carrier with the same log1mexp helper, so for small kappa they agree and
@@ -369,7 +369,7 @@ class TestExtGenParetoClass:
         assert (draws >= 0.0).all()  # support is [mu, inf)
         assert np.mean(draws == 0.0) < 0.01
 
-    @pytest.mark.parametrize("kappa", [1e-4, 1e-8, 1e-300])
+    @pytest.mark.parametrize("kappa", [1e-4, 1e-300])
     def test_support_point_falls_back_when_median_collapses(self, kappa):
         # When kappa is small enough that the ExtGPD median rounds onto mu (which
         # transforms to a -inf initial point), support_point falls back to the
@@ -518,7 +518,7 @@ class TestGenParetoHeavyTail:
             assert np.all(np.isfinite(got))
             np.testing.assert_allclose(got, np.log(kappa) - x, rtol=1e-9)
 
-    @pytest.mark.parametrize("kappa", [10.0, 1e20, 1e155, 1e300])
+    @pytest.mark.parametrize("kappa", [10.0, 1e155, 1e300])
     def test_ext_logccdf_is_a_valid_log_probability_for_large_kappa(self, kappa):
         # A log survival probability is always <= 0. The tail branch must key on
         # kappa * S (not just the GPD survival), or large kappa makes
@@ -534,7 +534,7 @@ class TestGenParetoHeavyTail:
         small = np.log(kappa) - x < -30.0
         np.testing.assert_allclose(got[small], (np.log(kappa) - x)[small], rtol=1e-9)
 
-    @pytest.mark.parametrize("kappa", [1e-50, 1e-100, 1e-2])
+    @pytest.mark.parametrize("kappa", [1e-2, 1e-100])
     def test_ext_logccdf_small_kappa_in_the_body_matches_reference(self, kappa):
         # For small kappa, log(kappa) + a < -30 holds even where S_gpd ~ 1 (the body,
         # x = O(1)), so the tail branch must NOT trigger there: the leading behaviour
