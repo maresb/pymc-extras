@@ -122,13 +122,6 @@ def _in_gpd_support(z, t):
     return pt.and_(z >= 0, 1 + t > 0)
 
 
-# The ``gen_pareto_*`` / ``ext_gen_pareto_*`` builders below are pure PyTensor:
-# they assemble the masked log-density / log-CDF / quantile graphs and call NO
-# PyMC parameter check, which keeps them portable (the math can be reused
-# elsewhere, e.g. in pytensor-distributions). Parameter validation lives only in
-# the Continuous wrapper classes, which add ``check_parameters`` / ``check_icdf_*``.
-
-
 def gen_pareto_logp(value, mu, sigma, xi):
     """Pure-PyTensor GPD log-density; out-of-support values map to ``-inf``."""
     z = (value - mu) / sigma
