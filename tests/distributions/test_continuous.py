@@ -53,18 +53,6 @@ pytestmark = pytest.mark.filterwarnings(
     "ignore:Numba will use object mode to run Generalized Extreme Value:UserWarning"
 )
 
-# The Generalized Pareto family legitimately evaluates to +/-inf at the
-# (measure-zero) support boundary and at probabilities 0 / 1; NumPy flags those
-# as divide-by-zero / invalid / overflow during ``.eval()``. They are the correct
-# boundary values (the numerical comparisons still validate them). Scope the FPE
-# silencing to the GPD test classes (via their ``pytestmark``) rather than muting
-# the whole module, which also holds the GenExtreme / Chi / Maxwell tests.
-_GPD_FPE_FILTERS = [
-    pytest.mark.filterwarnings("ignore:divide by zero encountered:RuntimeWarning"),
-    pytest.mark.filterwarnings("ignore:invalid value encountered:RuntimeWarning"),
-    pytest.mark.filterwarnings("ignore:overflow encountered:RuntimeWarning"),
-]
-
 
 class TestGenExtremeClass:
     """
@@ -309,8 +297,6 @@ class TestGenParetoClass:
     PyMC directly on adoption.
     """
 
-    pytestmark = _GPD_FPE_FILTERS
-
     def test_logp(self):
         check_logp(
             GenPareto,
@@ -400,8 +386,6 @@ class TestExtGenParetoClass:
     Wrapper class so that tests of experimental additions can be dropped into
     PyMC directly on adoption.
     """
-
-    pytestmark = _GPD_FPE_FILTERS
 
     def test_logp(self):
         check_logp(
@@ -586,8 +570,6 @@ class TestGenParetoBoundaries:
     ``q = 0``, ``q = 1`` (with ``xi < 0``), and ``sigma`` / ``kappa`` out of range.
     """
 
-    pytestmark = _GPD_FPE_FILTERS
-
     def test_logp_logcdf_at_infinity(self):
         # density at +inf is 0 (logp -inf); CDF at +inf is 1 (logcdf 0). The
         # xi=0 path is the delicate one: 0*inf is nan, so the +inf tail is pinned
@@ -641,8 +623,6 @@ class TestGenParetoHeavyTail:
     bound. But xi > 1 is precisely the infinite-mean regime where the median
     ``support_point`` matters, so test it directly against SciPy with rtol.
     """
-
-    pytestmark = _GPD_FPE_FILTERS
 
     @pytest.mark.parametrize("xi", [1.5, 5.0])
     def test_logp_logcdf_icdf_match_scipy(self, xi):
@@ -736,8 +716,6 @@ class TestGenParetoBoundaryPrecision:
     supplies ``s`` without cancellation); see the class docstring note.
     """
 
-    pytestmark = _GPD_FPE_FILTERS
-
     def test_boundary_logp_value_holds_but_gradient_tracks_the_margin(self):
         # One representative xi over a margin sweep is enough to pin the limit (the
         # s-cancellation mechanism is xi-independent): the largest margin (s = 1e-2,
@@ -804,8 +782,6 @@ class TestGenParetoTransforms:
     0; the probability-integral transform (``y = logit(F(x))``) is C1 in every
     parameter, so it does not inject a gradient kink when xi is random.
     """
-
-    pytestmark = _GPD_FPE_FILTERS
 
     def test_default_transform_is_registered(self):
         with pm.Model() as model:
