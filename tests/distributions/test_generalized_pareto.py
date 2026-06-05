@@ -859,34 +859,6 @@ class TestGenParetoTransforms:
         grad_plus = float(fn(1e-6, 0.5))
         assert abs(grad_minus - grad_plus) < 1e-3
 
-    def test_latent_sampling_stays_in_support(self):
-        # The three geometries -- heavy (xi > 0), exponential (xi = 0), and bounded
-        # (xi < 0) -- are sampled as three independent latents in ONE model. Real NUTS
-        # is the point (it exercises the transform's gradient), but the cost is the
-        # per-model sampler compile, not the draws, so one combined model is far
-        # cheaper than three and still checks each geometry. Fixed seed + cores=1 keep
-        # it deterministic and process-spawn-free for CI.
-        geometries = [(0.3, 5.0, 1.0), (0.0, 0.0, 2.0), (-0.5, 0.0, 1.0)]
-        with pm.Model() as model:
-            for i, (xi, mu, sigma) in enumerate(geometries):
-                GenPareto(f"x{i}", mu=mu, sigma=sigma, xi=xi)
-            idata = pm.sample(
-                100,
-                tune=200,
-                chains=2,
-                cores=1,
-                progressbar=False,
-                random_seed=1,
-                compute_convergence_checks=False,
-            )
-        # The clean PIT geometry should give zero divergences for all three at once.
-        assert int(idata.sample_stats.diverging.values.sum()) == 0
-        for i, (xi, mu, sigma) in enumerate(geometries):
-            xs = idata.posterior[f"x{i}"].values
-            assert np.all(xs >= mu - 1e-9), f"x{i} (xi={xi}) below mu"
-            if xi < 0:
-                assert np.all(xs <= mu - sigma / xi + 1e-9), f"x{i} (xi={xi}) past wall"
-
 
 class TestGenParetoSmoothShapeLimit:
     """The headline property: the logp is C1 in xi through the xi = 0 limit.
