@@ -204,13 +204,11 @@ class ExtGenPareto(Continuous):
             )
             idata = pm.sample()
 
-    Keep ``mu`` fixed. It is the lower endpoint of the support, where a
-    ``kappa < 1`` density diverges; fixing the threshold keeps that singularity away
-    from the data. A *free* ``mu`` slides up to ``min(data)`` to sit on the
-    divergence -- an unbounded likelihood / improper posterior, the lower-endpoint
-    mirror of the ``xi < -1`` upper wall (NUTS pins ``mu`` to ``min(data)`` with
-    ``kappa < 1``). If the threshold must be estimated, floor ``kappa >= 1`` (no
-    lower divergence) or put a prior on ``min(data) - mu`` that vanishes at 0.
+    Keep ``mu`` fixed: it is the lower endpoint, where a ``kappa < 1`` density
+    diverges. A free ``mu`` slides onto ``min(data)`` to sit on that divergence
+    (unbounded likelihood) -- the lower-endpoint mirror of the ``xi < -1`` upper
+    wall. If ``mu`` must be estimated, floor ``kappa >= 1`` or put a prior on
+    ``min(data) - mu`` that vanishes at 0.
     """
 
     rv_type = ExtGenParetoRV
