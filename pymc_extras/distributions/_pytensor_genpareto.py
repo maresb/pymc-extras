@@ -53,14 +53,6 @@ def _expm1_div(u: TensorVariable) -> TensorVariable:
     return pt.switch(use_series, series, pt.expm1(safe_u) / safe_u)
 
 
-# Generalized Pareto core. Standardize to z = (value - mu) / sigma >= 0. With
-# m = log1p(xi z) / xi the whole family is analytic in xi:
-#     survival   exp(-m) = (1 + xi z) ** (-1/xi)
-#     log-pdf    -log sigma - log1p(xi z) - m
-#     log-cdf    log(1 - exp(-m)) = log1mexp(-m)
-# All three reduce to the exponential law as xi -> 0 (m -> z).
-
-
 def _gpd_tail(z, xi):
     """``(t, log_s) = (xi * z, log(1 + xi * z))``, formed once per call.
 
