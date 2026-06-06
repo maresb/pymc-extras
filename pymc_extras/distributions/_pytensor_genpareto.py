@@ -105,9 +105,8 @@ def _in_gpd_support(z, t):
     return pt.and_(z >= 0, 1 + t > 0)
 
 
-def logpdf(value, mu, sigma, xi):
-    """GPD log-density; out-of-support values map to ``-inf``."""
-    z = (value - mu) / sigma
+def logpdf(x, mu, sigma, xi):
+    z = (x - mu) / sigma
     t, log_s = _gpd_tail(z, xi)
     logp = pt.switch(_in_gpd_support(z, t), _gpd_log_h(z, sigma, t, log_s), -np.inf)
     # The density vanishes at the +inf tail for every xi; for xi > 0 the
@@ -117,9 +116,8 @@ def logpdf(value, mu, sigma, xi):
     return logp
 
 
-def logcdf(value, mu, sigma, xi):
-    """GPD log-CDF."""
-    z = (value - mu) / sigma
+def logcdf(x, mu, sigma, xi):
+    z = (x - mu) / sigma
     t, _ = _gpd_tail(z, xi)
     # Three regions: below mu -> 0 (log -inf); for xi < 0 past the finite upper
     # endpoint mu - sigma/xi -> 1 (log 0); else log1mexp(-m).
@@ -131,16 +129,12 @@ def logcdf(value, mu, sigma, xi):
     return logcdf
 
 
-def logsf(value, mu, sigma, xi):
-    """GPD log complementary CDF (log survival function).
-
-    The survival exponent ``m`` is computed directly, so it stays exact in the
-    heavy upper tail where the generic ``log1mexp(logcdf)`` fallback collapses
-    (``logcdf -> 0`` there).
-    """
-    z = (value - mu) / sigma
+def logsf(x, mu, sigma, xi):
+    z = (x - mu) / sigma
     t, _ = _gpd_tail(z, xi)
-    logsf = _gpd_log_S(z, t)  # log S = -m, exact in the tail
+    # m directly (log S = -m): exact in the heavy tail, where the generic
+    # log1mexp(logcdf) survival fallback collapses (logcdf -> 0 there).
+    logsf = _gpd_log_S(z, t)
     # For xi < 0 past the finite upper endpoint, and at the +inf tail, S = 0.
     above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + t, 0))
     logsf = pt.switch(pt.or_(above_upper, pt.eq(z, np.inf)), -np.inf, logsf)
@@ -149,13 +143,12 @@ def logsf(value, mu, sigma, xi):
     return logsf
 
 
-def ppf(value, mu, sigma, xi):
-    """GPD quantile function (assumes ``0 <= value <= 1``)."""
-    value = pt.as_tensor_variable(value)
-    excess = -pt.log1p(-value)  # = -log(1 - q) = m
+def ppf(q, mu, sigma, xi):
+    q = pt.as_tensor_variable(q)
+    excess = -pt.log1p(-q)  # = -log(1 - q) = m
     x = _gpd_quantile_from_excess(excess, mu, sigma, xi)
     # Explicit endpoints: q=1 -> finite upper bound (xi<0) or +inf, q=0 -> mu.
     # Without this, q=1 with xi<0 is ``inf * 0 = nan`` rather than ``mu - sigma/xi``.
-    x = pt.switch(pt.eq(value, 1), _gpd_upper_bound(mu, sigma, xi), x)
-    x = pt.switch(pt.eq(value, 0), mu, x)
+    x = pt.switch(pt.eq(q, 1), _gpd_upper_bound(mu, sigma, xi), x)
+    x = pt.switch(pt.eq(q, 0), mu, x)
     return x

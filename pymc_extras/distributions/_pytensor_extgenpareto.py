@@ -31,9 +31,8 @@ from pymc_extras.distributions._pytensor_genpareto import (
 # kappa = 1 recovers the plain GPD.
 
 
-def logpdf(value, mu, sigma, xi, kappa):
-    """Extended-GPD log-density; out-of-support values map to ``-inf``."""
-    z = (value - mu) / sigma
+def logpdf(x, mu, sigma, xi, kappa):
+    z = (x - mu) / sigma
     t, log_s = _gpd_tail(z, xi)
     # log g = log kappa + (kappa - 1) log H + log h. The carrier term vanishes
     # at kappa = 1; guarding it keeps the GPD reduction exact at the lower
@@ -45,9 +44,8 @@ def logpdf(value, mu, sigma, xi, kappa):
     return logp
 
 
-def logcdf(value, mu, sigma, xi, kappa):
-    """Extended-GPD log-CDF."""
-    z = (value - mu) / sigma
+def logcdf(x, mu, sigma, xi, kappa):
+    z = (x - mu) / sigma
     t, _ = _gpd_tail(z, xi)
     above_upper = pt.and_(pt.lt(xi, 0), pt.le(1 + t, 0))
     logcdf = pt.switch(above_upper, 0.0, kappa * _gpd_log_H(z, t))
@@ -56,29 +54,8 @@ def logcdf(value, mu, sigma, xi, kappa):
     return logcdf
 
 
-def logsf(value, mu, sigma, xi, kappa):
-    """Extended-GPD log complementary CDF (log survival function).
-
-    ``S = 1 - H ** kappa``, with ``a = log(1 - H) = -m`` the GPD log survival
-    (exact in the tail) and ``s = S_gpd = exp(a)``. The generic
-    ``log1mexp(kappa * log H)`` is exact everywhere *except* the deep upper tail,
-    where ``log H`` underflows to ``0`` and it collapses to ``-inf`` although the
-    survival is still finite (``1 - H**kappa ~ kappa s``). A tail expansion takes
-    over there:
-
-    ``1 - H**kappa = 1 - (1 - s)**kappa = kappa s [1 + (s - r)/2 + (r**2 - 3 r s
-    + 2 s**2)/6 + ...]`` with ``r = kappa s``.
-
-    This is an expansion in *both* ``s`` and ``r = kappa s``, so it is only valid
-    when both are small; writing the correction in ``s`` and ``r`` keeps every term
-    bounded (no ``kappa**k`` powers, which overflow for huge kappa). It is gated on
-    *both* ``a < -30`` (``s`` small) and ``log(kappa) + a < -30`` (``r`` small) --
-    not on ``log(kappa) + a`` alone, which for tiny kappa holds even when ``s ~ 1``
-    (the body), where the leading behaviour is ``log(kappa) + log(-log H)`` and the
-    exact generic branch must be used. Matches a high-precision reference across
-    kappa from ``1e-300`` (body and tail) to ``1e300`` (far tail).
-    """
-    z = (value - mu) / sigma
+def logsf(x, mu, sigma, xi, kappa):
+    z = (x - mu) / sigma
     t, _ = _gpd_tail(z, xi)
     a = _gpd_log_S(z, t)  # log(1 - H), exact in the tail
     log_H = pt.log1mexp(a)
@@ -121,13 +98,12 @@ def _ext_gpd_excess_from_log_prob(log_q, kappa):
     return -pt.log1mexp(log_q / kappa)
 
 
-def ppf(value, mu, sigma, xi, kappa):
-    """Extended-GPD quantile function (assumes ``0 <= value <= 1``)."""
-    value = pt.as_tensor_variable(value)
+def ppf(q, mu, sigma, xi, kappa):
+    q = pt.as_tensor_variable(q)
     # F = H ** kappa = q  ->  H = q ** (1/kappa); excess m = -log(1 - H), built
     # with log1mexp so a tiny 1 - H (small kappa) is not rounded away to 0.
-    excess = _ext_gpd_excess_from_log_prob(pt.log(value), kappa)
+    excess = _ext_gpd_excess_from_log_prob(pt.log(q), kappa)
     x = _gpd_quantile_from_excess(excess, mu, sigma, xi)
-    x = pt.switch(pt.eq(value, 1), _gpd_upper_bound(mu, sigma, xi), x)
-    x = pt.switch(pt.eq(value, 0), mu, x)
+    x = pt.switch(pt.eq(q, 1), _gpd_upper_bound(mu, sigma, xi), x)
+    x = pt.switch(pt.eq(q, 0), mu, x)
     return x
