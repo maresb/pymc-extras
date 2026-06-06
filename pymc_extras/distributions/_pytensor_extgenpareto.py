@@ -12,9 +12,19 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
+"""Extended Generalized Pareto distribution (Naveau et al. 2016 Type 1), in pure
+PyTensor.
+
+Intended for upstreaming to pymc-devs/pytensor-distributions and kept here in that
+project's module shape (``logpdf``/``logcdf``/``logsf``/``cdf``/``pdf``/``sf``/
+``ppf``/``isf``/``rvs``, value argument ``x`` / ``q``) so pymc-extras can swap to a
+``from pytensor_distributions import extgenpareto`` import once it depends on it.
+"""
+
 import numpy as np
 import pytensor.tensor as pt
 
+from pymc_extras.distributions._pytensor_distributions_helper import ppf_bounds_cont
 from pymc_extras.distributions._pytensor_genpareto import (
     _gpd_log_H,
     _gpd_log_h,
@@ -104,6 +114,31 @@ def ppf(q, mu, sigma, xi, kappa):
     # with log1mexp so a tiny 1 - H (small kappa) is not rounded away to 0.
     excess = _ext_gpd_excess_from_log_prob(pt.log(q), kappa)
     x = _gpd_quantile_from_excess(excess, mu, sigma, xi)
-    x = pt.switch(pt.eq(q, 1), _gpd_upper_bound(mu, sigma, xi), x)
-    x = pt.switch(pt.eq(q, 0), mu, x)
-    return x
+    return ppf_bounds_cont(x, q, mu, _gpd_upper_bound(mu, sigma, xi))
+
+
+def cdf(x, mu, sigma, xi, kappa):
+    return pt.exp(logcdf(x, mu, sigma, xi, kappa))
+
+
+def pdf(x, mu, sigma, xi, kappa):
+    return pt.exp(logpdf(x, mu, sigma, xi, kappa))
+
+
+def sf(x, mu, sigma, xi, kappa):
+    return pt.exp(logsf(x, mu, sigma, xi, kappa))
+
+
+def isf(x, mu, sigma, xi, kappa):
+    x = pt.as_tensor_variable(x)
+    # log F = log1p(-x), accurate for tiny x; ppf(1 - x) forms 1 - x first and loses it.
+    excess = _ext_gpd_excess_from_log_prob(pt.log1p(-x), kappa)
+    quantile = _gpd_quantile_from_excess(excess, mu, sigma, xi)
+    return ppf_bounds_cont(quantile, x, _gpd_upper_bound(mu, sigma, xi), mu)
+
+
+def rvs(mu, sigma, xi, kappa, size=None, random_state=None):
+    # Inverse-CDF on a carrier draw u = F; excess = -log(1 - u ** (1/kappa)).
+    u = pt.random.uniform(size=size, rng=random_state)
+    excess = _ext_gpd_excess_from_log_prob(pt.log(u), kappa)
+    return _gpd_quantile_from_excess(excess, mu, sigma, xi)

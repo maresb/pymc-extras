@@ -43,7 +43,12 @@ from pymc.testing import (
 from scipy import stats
 
 # the distributions to be tested
-from pymc_extras.distributions import ExtGenPareto, GenPareto
+from pymc_extras.distributions import (
+    ExtGenPareto,
+    GenPareto,
+    _pytensor_extgenpareto,
+    _pytensor_genpareto,
+)
 from pymc_extras.distributions._pymc_extgenpareto import _ExtGenParetoPIT
 from pymc_extras.distributions._pytensor_extgenpareto import logpdf as ext_gen_pareto_logp
 from pymc_extras.distributions._pytensor_genpareto import logpdf as gen_pareto_logp
@@ -883,3 +888,48 @@ class TestGenParetoSmoothShapeLimit:
             lp = pm.logp(GenPareto.dist(mu=0.0, sigma=2.0, xi=xi), value).eval()
             np.testing.assert_allclose(lp, lp0, atol=1e-5)
         np.testing.assert_allclose(lp0, sp.expon.logpdf(value, scale=2.0), atol=1e-12)
+
+
+class TestPyTensorFunctionalAPI:
+    """The vendored functional API (cdf/pdf/sf/isf + ppf bounds) is self-consistent.
+
+    These wrappers exist for the pytensor-distributions drop-in; pymc-extras itself
+    uses only logpdf/logcdf/logsf/ppf, so this just guards the wrappers from typos.
+    (rvs is not exercised here -- it reuses the same inverse-CDF as the tested RV op.)
+    """
+
+    @pytest.mark.parametrize(
+        "module, params",
+        [(_pytensor_genpareto, (0.0, 1.0, 0.2)), (_pytensor_extgenpareto, (0.0, 1.0, 0.2, 1.5))],
+        ids=["genpareto", "extgenpareto"],
+    )
+    def test_functional_api_is_self_consistent(self, module, params):
+        x = np.array([0.3, 1.0, 3.0])
+        np.testing.assert_allclose(
+            module.cdf(x, *params).eval(), np.exp(module.logcdf(x, *params).eval())
+        )
+        np.testing.assert_allclose(
+            module.pdf(x, *params).eval(), np.exp(module.logpdf(x, *params).eval())
+        )
+        np.testing.assert_allclose(
+            module.sf(x, *params).eval(), np.exp(module.logsf(x, *params).eval())
+        )
+        np.testing.assert_allclose(
+            module.cdf(x, *params).eval() + module.sf(x, *params).eval(), 1.0, atol=1e-9
+        )
+        # isf agrees with ppf(1 - q) where both are accurate (away from the tails)
+        q = np.array([0.1, 0.5, 0.9])
+        np.testing.assert_allclose(module.isf(q, *params).eval(), module.ppf(1 - q, *params).eval())
+        # ppf bounds: NaN outside [0, 1]; q = 0 -> mu (the lower support edge)
+        assert np.all(np.isnan(module.ppf(np.array([-0.1, 1.1]), *params).eval()))
+        np.testing.assert_allclose(float(module.ppf(0.0, *params).eval()), 0.0)
+
+    def test_isf_keeps_the_upper_tail(self):
+        # isf(x) for tiny x (upper tail) must not lose x to a 1 - x subtraction.
+        # GPD at xi=0 has the closed form isf(x) = -log(x); ppf(1 - x) degrades there.
+        x = np.array([1e-8, 1e-12, 1e-15])
+        xi = pt.constant(0.0)  # tensor so the xi=0 upper-bound division stays symbolic
+        isf_val = _pytensor_genpareto.isf(x, 0.0, 1.0, xi).eval()
+        np.testing.assert_allclose(isf_val, -np.log(x), rtol=1e-12)
+        naive = _pytensor_genpareto.ppf(1 - x, 0.0, 1.0, xi).eval()
+        assert abs(isf_val[-1] - -np.log(x[-1])) < abs(naive[-1] - -np.log(x[-1]))

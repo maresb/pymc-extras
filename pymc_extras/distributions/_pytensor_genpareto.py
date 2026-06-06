@@ -12,10 +12,20 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
+"""Generalized Pareto distribution, in pure PyTensor.
+
+Intended for upstreaming to pymc-devs/pytensor-distributions and kept here in that
+project's module shape (``logpdf``/``logcdf``/``logsf``/``cdf``/``pdf``/``sf``/
+``ppf``/``isf``/``rvs``, value argument ``x`` / ``q``) so pymc-extras can swap to a
+``from pytensor_distributions import genpareto`` import once it depends on it.
+"""
+
 import numpy as np
 import pytensor.tensor as pt
 
 from pytensor.tensor.variable import TensorVariable
+
+from pymc_extras.distributions._pytensor_distributions_helper import ppf_bounds_cont
 
 
 def _series_cutoff(dtype) -> float:
@@ -145,10 +155,30 @@ def logsf(x, mu, sigma, xi):
 
 def ppf(q, mu, sigma, xi):
     q = pt.as_tensor_variable(q)
-    excess = -pt.log1p(-q)  # = -log(1 - q) = m
-    x = _gpd_quantile_from_excess(excess, mu, sigma, xi)
-    # Explicit endpoints: q=1 -> finite upper bound (xi<0) or +inf, q=0 -> mu.
-    # Without this, q=1 with xi<0 is ``inf * 0 = nan`` rather than ``mu - sigma/xi``.
-    x = pt.switch(pt.eq(q, 1), _gpd_upper_bound(mu, sigma, xi), x)
-    x = pt.switch(pt.eq(q, 0), mu, x)
-    return x
+    x = _gpd_quantile_from_excess(-pt.log1p(-q), mu, sigma, xi)  # excess = -log(1 - q)
+    return ppf_bounds_cont(x, q, mu, _gpd_upper_bound(mu, sigma, xi))
+
+
+def cdf(x, mu, sigma, xi):
+    return pt.exp(logcdf(x, mu, sigma, xi))
+
+
+def pdf(x, mu, sigma, xi):
+    return pt.exp(logpdf(x, mu, sigma, xi))
+
+
+def sf(x, mu, sigma, xi):
+    return pt.exp(logsf(x, mu, sigma, xi))
+
+
+def isf(x, mu, sigma, xi):
+    x = pt.as_tensor_variable(x)
+    # m = -log(x) directly; ppf(1 - x) would lose a tiny x to the 1 - x rounding.
+    quantile = _gpd_quantile_from_excess(-pt.log(x), mu, sigma, xi)
+    return ppf_bounds_cont(quantile, x, _gpd_upper_bound(mu, sigma, xi), mu)
+
+
+def rvs(mu, sigma, xi, size=None, random_state=None):
+    # Inverse-CDF on a survival draw: excess = -log(v) avoids the 1 - v cancellation.
+    v = pt.random.uniform(size=size, rng=random_state)
+    return _gpd_quantile_from_excess(-pt.log(v), mu, sigma, xi)
