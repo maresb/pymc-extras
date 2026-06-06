@@ -252,17 +252,9 @@ class ExtGenPareto(Continuous):
         return check_icdf_parameters(res, sigma > 0, kappa > 0, msg="sigma > 0, kappa > 0")
 
     def support_point(rv, size, mu, sigma, xi, kappa):
-        # The ExtGPD median solves H(m) ** kappa = 1/2 (carrier H = 0.5 ** (1/kappa)),
-        # recovered with the shared log1mexp inverse. For small kappa that carrier is
-        # so close to 0 that the median is sub-ULP from mu and rounds onto it, which
-        # transforms to a -inf initial point. A support point only has to be a usable
-        # initialization, so when the median collapses to mu fall back to the
-        # underlying GPD median (carrier H = 1/2, excess = log 2) -- a higher ExtGPD
-        # quantile (F = 0.5 ** kappa) at mu + O(sigma), interior (hence a finite
-        # transformed logp) for any kappa at ordinary scales. It can still round
-        # back to mu in the general representability limit where the support has no
-        # distinct interior point (sigma far below ulp(mu), or a sub-ULP bounded
-        # support). At kappa = 1 the two coincide, so ordinary kappa is unchanged.
+        # ExtGPD median (carrier H = 0.5 ** (1/kappa)); for small kappa it rounds onto
+        # mu (a -inf initial point), so fall back to the GPD median (excess = log 2),
+        # interior for any kappa at ordinary scales. kappa = 1: the two coincide.
         excess = extgenpareto._ext_gpd_excess_from_log_prob(np.log(0.5), kappa)
         median = genpareto._gpd_quantile_from_excess(excess, mu, sigma, xi)
         gpd_median = genpareto._gpd_quantile_from_excess(np.log(2.0), mu, sigma, xi)
@@ -281,23 +273,11 @@ class _ExtGenParetoPIT(_GPDProbabilityIntegralTransform):
 
     @staticmethod
     def _excess_from_y(value, mu, sigma, xi, kappa):
-        # m = -log(1 - H), the GPD-survival exponent, from the carrier inverse
-        # H = F_ext ** (1/kappa) = exp(-a), a = -log(F_ext)/kappa >= 0, and
-        # y = logit(F_ext). So m = -log(1 - exp(-a)) = -log1mexp(-a).
-        #
-        # Bulk (value < cutoff): a from log F_ext = -softplus(-y); the log1mexp keeps a
-        # tiny GPD survival from rounding to 0 in the small-kappa regime.
-        #
-        # Tail (value >= cutoff): -softplus(-y) underflows to 0, so carry log(a) instead
-        # of a. With S_ext = exp(-t), t = softplus(y),
-        #   -log(F_ext) = -log1p(-S_ext) = S_ext * genpareto._log1p_div(-S_ext),
-        # so log_a = -t + log(genpareto._log1p_div(-S_ext)) - log(kappa), finite until t overflows.
-        # m = -log1mexp(-a), with a -> 0 (m ~ -log_a) and a -> inf (m ~ 0) split out so a
-        # itself never over/underflows. Both branches run on clamped inputs so the
-        # discarded one (and its gradient) stays finite.
-        #
-        # cutoff = where exp(-y) underflows, dtype-aware (~700 float64, ~80 float32);
-        # float64 is min(700, 708.4 - 8) = 700.
+        # GPD excess m = -log1mexp(-a) from the carrier inverse a = -log(F_ext)/kappa,
+        # F_ext = sigmoid(y). Split at the cutoff where exp(-y) underflows (dtype-aware):
+        # the tail carries log(a) rather than a (which would underflow), via
+        # -log(F_ext) = S_ext * log1p_div(-S_ext). Both branches run on clamped inputs
+        # so the discarded one stays finite.
         cutoff = np.asarray(
             min(700.0, float(-np.log(np.finfo(value.dtype).tiny)) - 8.0), dtype=value.dtype
         )

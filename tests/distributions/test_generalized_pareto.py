@@ -367,9 +367,9 @@ class TestExtGenParetoClass:
         expected_fallback = mu + sigma * np.log(2.0)  # GPD median, xi = 0
         np.testing.assert_allclose(sp, expected_fallback, rtol=1e-12)
         assert sp > mu
-        # The headline fix: a finite default initial logp for every kappa > 0
-        # (the forward map is logcdf - logccdf in log space, finite even when the
-        # transformed point is deep, e.g. y ~ 691 for kappa = 1e-300).
+        # A finite default initial logp for every kappa > 0 (the forward map is
+        # logcdf - logccdf in log space, finite even when the transformed point is
+        # deep, e.g. y ~ 691 for kappa = 1e-300).
         assert np.isfinite(model.compile_logp()(model.initial_point()))
 
     def test_rng_matches_distribution(self):
@@ -746,10 +746,12 @@ class TestGenParetoTransforms:
                 logistic = -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y)
                 np.testing.assert_allclose(lp, logistic, atol=1e-3)
 
-    def test_small_kappa_collapse_still_targets_the_correct_logistic(self):
-        # For kappa << 1 the ExtGPD is numerically a point mass at mu, so the quantile
-        # collapses onto mu in float64. The sampler still targets the correct
-        # Logistic(y) density (the recovered readout is just quantized at mu).
+    def test_small_kappa_collapse_saturates_with_exact_density(self):
+        # Characterize the representability boundary head-on (not select around it).
+        # For kappa << 1 the ExtGPD median sits ~0.5 ** (1/kappa) below mu, under
+        # ulp(mu), so the whole bulk is a numerical point mass: distinct y all map to
+        # the same floored x. The map is therefore NOT injective here -- but the
+        # sampled density stays exactly Logistic and the readout stays in support.
         mu = 2.0
         with pm.Model() as model:
             x = ExtGenPareto("x", mu=mu, sigma=1.0, xi=0.0, kappa=0.01)
@@ -758,11 +760,19 @@ class TestGenParetoTransforms:
         inputs = x.owner.inputs
         logp = pytensor.function([yv], model.logp(sum=True))
         backward = pytensor.function([yv], tr.backward(yv, *inputs))
-        for y in (-10.0, 0.0):
+        roundtrip = pytensor.function([yv], tr.forward(tr.backward(yv, *inputs), *inputs))
+        ys = (-10.0, -5.0, 0.0)
+        xs = [float(backward(y)) for y in ys]
+        rts = [float(roundtrip(y)) for y in ys]
+        # saturation: distinct y collapse onto one floored x, just above mu (in support)
+        assert xs[0] == xs[1] == xs[2] > mu
+        # so it is not injective here -- forward(backward(.)) is constant, not identity
+        assert rts[0] == rts[1] == rts[2]
+        # yet the sampled density is still exactly Logistic at each y
+        for y in ys:
             np.testing.assert_allclose(
                 float(logp(y)), -np.logaddexp(0.0, y) - np.logaddexp(0.0, -y), atol=1e-2
             )
-            assert float(backward(y)) >= mu  # readout stays in support
 
     def test_transform_finite_under_float32(self):
         # dtype-aware floor: the small-kappa lower-tail collapse must not NaN under
@@ -815,9 +825,9 @@ class TestGenParetoTransforms:
         np.testing.assert_allclose(float(roundtrip(710.0)), 710.0, rtol=1e-5)
 
     def test_jacobian_gradient_is_continuous_through_xi_zero(self):
-        # The headline reason for the probability-integral transform: with xi a
-        # random variable, the transformed logp must be C1 in xi across 0. An
-        # Interval transform fails this (its Jacobian jumps by ~1e12 at xi = 0).
+        # Why a PIT and not an Interval transform: with random xi the transformed
+        # logp must be C1 in xi across 0; an Interval transform's Jacobian jumps by
+        # ~1e12 at xi = 0, driving divergences.
         with pm.Model() as model:
             xi = pm.Normal("xi", 0.0, 1.0)
             GenPareto("x", mu=0.0, sigma=1.0, xi=xi)
@@ -831,7 +841,7 @@ class TestGenParetoTransforms:
 
 
 class TestGenParetoSmoothShapeLimit:
-    """The headline property: the logp is C1 in xi through the xi = 0 limit.
+    """The logp is C1 in xi through the xi = 0 limit.
 
     A ``switch(isclose(xi, 0), ...)`` reparametrization is only C0 there -- the
     gradient jumps -- which drives NUTS divergences for data that pulls xi near

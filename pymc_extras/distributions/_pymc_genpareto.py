@@ -239,9 +239,8 @@ class _GPDProbabilityIntegralTransform(Transform):
     Latent (Ext)GPD support depends on xi (``[mu, inf)`` for ``xi >= 0``, bounded
     ``[mu, mu - sigma/xi)`` for ``xi < 0``). An ``Interval`` transform's log-Jacobian
     is discontinuous in xi at 0 -- the upper endpoint ``mu - sigma/xi`` diverges --
-    a kink that with random xi causes divergences (measured 163/1600, vs 3 for this
-    PIT). The family's own CDF makes the transformed prior exactly Logistic,
-    parameter-free and C1, so the kink is gone.
+    a kink that drives divergences when xi is random. The family's own CDF makes the
+    transformed prior exactly Logistic, parameter-free and C1, so the kink is gone.
 
     A strict bijection (``forward(backward(y)) == y``) wherever the quantile is
     float64-representable: all of GenPareto, and ExtGenPareto down to ``kappa ~ 0.1``.
