@@ -12,8 +12,9 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-"""``ppf_bounds_cont`` vendored verbatim from pymc-devs/pytensor-distributions
-(``pytensor_distributions/helper.py``).
+"""``ppf_bounds_cont`` vendored verbatim from pymc-devs/pytensor-distributions.
+
+https://github.com/pymc-devs/pytensor-distributions/blob/13ab4708a5fce7b4f73bd35014c73ca7a8667d6a/pytensor_distributions/helper.py
 """
 
 import pytensor.tensor as pt
