@@ -6,35 +6,44 @@ import numpy as np
 import pytensor.tensor as pt
 
 from pymc.distributions import Bernoulli, Categorical, DiscreteUniform
-from pymc.distributions.distribution import _support_point, support_point
-from pymc.logprob.abstract import MeasurableOp, _logprob
+from pymc.logprob.abstract import _logprob
 from pymc.logprob.basic import conditional_logp, logp
 from pymc.pytensorf import constant_fold
-from pytensor.compile.builders import OpFromGraph
 from pytensor.compile.mode import Mode
-from pytensor.graph import FunctionGraph, Op, vectorize_graph
-from pytensor.graph.basic import Variable, equal_computations
+from pytensor.graph import Op, node_rewriter, vectorize_graph
 from pytensor.graph.replace import clone_replace, graph_replace
 from pytensor.scan import map as scan_map
 from pytensor.scan import scan
 from pytensor.tensor import TensorVariable
-from pytensor.tensor.random.type import RandomType
 
 from pymc_extras.distributions import DiscreteMarkovChain
+from pymc_extras.model.marginal.distributions.core import (
+    MarginalRV,
+    inline_ofg_outputs,
+    marginalized_conditional,
+)
+from pymc_extras.model.marginal.graph_analysis import subgraph_batch_dim_connection
+from pymc_extras.model.marginal.rewrites import (
+    MarginalSubgraph,
+    extract_marginal_subgraph,
+    marginal_rewrites_db,
+)
 
 
-class MarginalRV(OpFromGraph, MeasurableOp):
-    """Base class for Marginalized RVs"""
+class EnumerableMarginalRV(MarginalRV):
+    """Base class for enumerable Marginalized RVs with closed-form logp."""
 
     def __init__(
         self,
         *args,
         dims_connections: tuple[tuple[int | None], ...],
-        dims: tuple[Variable, ...],
+        marginalized_dims,
+        n_dependent_rvs: int,
         **kwargs,
     ) -> None:
         self.dims_connections = dims_connections
-        self.dims = dims
+        self.marginalized_dims = marginalized_dims
+        self.n_dependent_rvs = n_dependent_rvs
         super().__init__(*args, **kwargs)
 
     @property
@@ -54,83 +63,35 @@ class MarginalRV(OpFromGraph, MeasurableOp):
             )
         return tuple(support_axes_vars)
 
-    def __eq__(self, other):
-        # Just to allow easy testing of equivalent models,
-        # This can be removed once https://github.com/pymc-devs/pytensor/issues/1114 is fixed
-        if type(self) is not type(other):
-            return False
 
-        return equal_computations(
-            self.inner_outputs,
-            other.inner_outputs,
-            self.inner_inputs,
-            other.inner_inputs,
+class NonSeparableLogpWarning(UserWarning):
+    pass
+
+
+def warn_non_separable_logp(values):
+    if len(values) > 1:
+        warnings.warn(
+            "There are multiple dependent variables in a FiniteDiscreteMarginalRV. "
+            f"Their joint logp terms will be assigned to the first value: {values[0]}.",
+            NonSeparableLogpWarning,
+            stacklevel=2,
         )
 
-    def __hash__(self):
-        # Just to allow easy testing of equivalent models,
-        # This can be removed once https://github.com/pymc-devs/pytensor/issues/1114 is fixed
-        return hash((type(self), len(self.inner_inputs), len(self.inner_outputs)))
+
+DUMMY_ZERO = pt.constant(0, name="dummy_zero")
 
 
-@_support_point.register
-def support_point_marginal_rv(op: MarginalRV, rv, *inputs):
-    """Support point for a marginalized RV.
-
-    The support point of a marginalized RV is the support point of the inner RV,
-    conditioned on the marginalized RV taking its support point.
-    """
-    outputs = rv.owner.outputs
-
-    fgraph = op.fgraph.clone()
-    inner_inputs = fgraph.inputs
-    inner_outputs = fgraph.outputs
-    del op
-
-    inner_rv = inner_outputs[outputs.index(rv)]
-    marginalized_inner_rv, *other_dependent_inner_rvs = (
-        out for out in inner_outputs if out is not inner_rv and not isinstance(out.type, RandomType)
-    )
-
-    # Replace references to inner rvs by the dummy variables (including the marginalized RV)
-    # This is necessary because the inner RVs may depend on each other
-    marginalized_inner_rv_dummy = marginalized_inner_rv.clone()
-    # Map inner rvs to dummies, saving what outer output each corresponds to.
-    # We need dummies because inner RVs may depend on each other.
-    inner_to_dummy_replacements = []
-    dummy_to_outer_replacements = []
-    for other_inner_rv in other_dependent_inner_rvs:
-        dummy = other_inner_rv.clone()
-        inner_to_dummy_replacements.append((other_inner_rv, dummy))
-        dummy_to_outer_replacements.append((dummy, outputs[inner_outputs.index(other_inner_rv)]))
-
-    fgraph.replace(marginalized_inner_rv, marginalized_inner_rv_dummy, import_missing=True)
-    fgraph.replace_all(tuple(inner_to_dummy_replacements), import_missing=True)
-
-    # Get support point of inner RV and marginalized RV
-    inner_rv_support_point = support_point(inner_rv)
-    marginalized_inner_rv_support_point = support_point(marginalized_inner_rv)
-
-    fgraph = FunctionGraph(outputs=[inner_rv_support_point], clone=False)
-    # Replace the marginalized RV dummy by its support point
-    fgraph.replace(
-        marginalized_inner_rv_dummy, marginalized_inner_rv_support_point, import_missing=True
-    )
-    # Replace the inner inputs by the outer inputs
-    fgraph.replace_all(tuple(zip(inner_inputs, inputs)), import_missing=True)
-    # Replace other dependent RVs dummies by the respective outer outputs.
-    # PyMC will replace them by their support points later
-    fgraph.replace_all(tuple(dummy_to_outer_replacements), import_missing=True)
-
-    [rv_support_point] = fgraph.outputs
-    return rv_support_point
+def align_logp_dims(dims: tuple[int | None, ...], logp: TensorVariable) -> TensorVariable:
+    """Align the logp with the order specified in dims."""
+    dims_alignment = [dim for dim in dims if dim is not None]
+    return logp.transpose(*dims_alignment)
 
 
-class MarginalFiniteDiscreteRV(MarginalRV):
+class MarginalFiniteDiscreteRV(EnumerableMarginalRV):
     """Base class for Marginalized Finite Discrete RVs"""
 
 
-class MarginalDiscreteMarkovChainRV(MarginalRV):
+class MarginalDiscreteMarkovChainRV(EnumerableMarginalRV):
     """Base class for Marginalized Discrete Markov Chain RVs"""
 
 
@@ -202,46 +163,12 @@ def reduce_batch_dependent_logps(
     return reduced_logp
 
 
-def align_logp_dims(dims: tuple[tuple[int, None]], logp: TensorVariable) -> TensorVariable:
-    """Align the logp with the order specified in dims."""
-    dims_alignment = [dim for dim in dims if dim is not None]
-    return logp.transpose(*dims_alignment)
-
-
-def inline_ofg_outputs(op: OpFromGraph, inputs: Sequence[Variable]) -> tuple[Variable]:
-    """Inline the inner graph (outputs) of an OpFromGraph Op.
-
-    Whereas `OpFromGraph` "wraps" a graph inside a single Op, this function "unwraps"
-    the inner graph.
-    """
-    return graph_replace(
-        op.inner_outputs,
-        replace=tuple(zip(op.inner_inputs, inputs)),
-        strict=False,
-    )
-
-
-class NonSeparableLogpWarning(UserWarning):
-    pass
-
-
-def warn_non_separable_logp(values):
-    if len(values) > 1:
-        warnings.warn(
-            "There are multiple dependent variables in a FiniteDiscreteMarginalRV. "
-            f"Their joint logp terms will be assigned to the first value: {values[0]}.",
-            NonSeparableLogpWarning,
-            stacklevel=2,
-        )
-
-
-DUMMY_ZERO = pt.constant(0, name="dummy_zero")
-
-
 @_logprob.register(MarginalFiniteDiscreteRV)
 def finite_discrete_marginal_rv_logp(op: MarginalFiniteDiscreteRV, values, *inputs, **kwargs):
     # Clone the inner RV graph of the Marginalized RV
-    marginalized_rv, *inner_rvs = inline_ofg_outputs(op, inputs)
+    all_outputs = inline_ofg_outputs(op, inputs)
+    marginalized_rv = all_outputs[0]
+    inner_rvs = list(all_outputs[1 : 1 + op.n_dependent_rvs])
 
     # Obtain the joint_logp graph of the inner RV graph
     inner_rv_values = dict(zip(inner_rvs, values))
@@ -305,7 +232,9 @@ def finite_discrete_marginal_rv_logp(op: MarginalFiniteDiscreteRV, values, *inpu
 
 @_logprob.register(MarginalDiscreteMarkovChainRV)
 def marginal_hmm_logp(op, values, *inputs, **kwargs):
-    chain_rv, *dependent_rvs = inline_ofg_outputs(op, inputs)
+    all_outputs = inline_ofg_outputs(op, inputs)
+    chain_rv = all_outputs[0]
+    dependent_rvs = list(all_outputs[1 : 1 + op.n_dependent_rvs])
 
     P, n_steps_, init_dist_, rng = chain_rv.owner.inputs
     domain = pt.arange(P.shape[-1], dtype="int32")
@@ -377,3 +306,121 @@ def marginal_hmm_logp(op, values, *inputs, **kwargs):
     warn_non_separable_logp(values)
     dummy_logps = (DUMMY_ZERO,) * (len(values) - 1)
     return joint_logp, *dummy_logps
+
+
+@marginalized_conditional.register(MarginalFiniteDiscreteRV)
+def finite_discrete_marginalized_conditional(op, inputs, dep_rvs):
+    # The logp must be derived over root placeholders, not the real
+    # inputs/dep_rvs: conditional_logp clones the rv graphs (leaking clones
+    # of named upstream variables into the result), and dep_rvs have other
+    # random variables in their ancestry, which trips the "RVs in logp graph"
+    # warning in the conditional_logp calls that nested MarginalRV logps
+    # perform internally (warn_rvs cannot be forwarded there). Work on the
+    # inner (nominal) graph with value dummies and substitute the real
+    # variables once at the end.
+    marginalized = op.inner_outputs[0]
+    dependents = list(op.inner_outputs[1 : 1 + op.n_dependent_rvs])
+
+    marginalized_value = marginalized.clone()
+    dep_dummies = [dep.type() for dep in dependents]
+    rvs_to_values = {marginalized: marginalized_value}
+    rvs_to_values.update(zip(dependents, dep_dummies))
+
+    logps_dict = conditional_logp(rvs_to_values)
+    marginalized_logp = logps_dict[marginalized_value]
+    dependent_logps = [logps_dict[dummy] for dummy in dep_dummies]
+
+    joint_logp = marginalized_logp + reduce_batch_dependent_logps(
+        op.dims_connections,
+        [dep.owner.op for dep in dependents],
+        dependent_logps,
+    )
+
+    rv_shape = constant_fold(tuple(marginalized.shape), raise_not_constant=False)
+    rv_domain = get_domain_of_finite_discrete_rv(marginalized)
+    rv_domain_tensor = pt.moveaxis(
+        pt.full(
+            (*rv_shape, len(rv_domain)),
+            rv_domain,
+            dtype=marginalized.dtype,
+        ),
+        -1,
+        0,
+    )
+
+    batched_joint_logp = vectorize_graph(
+        joint_logp,
+        replace={marginalized_value: rv_domain_tensor},
+    )
+    batched_joint_logp = pt.moveaxis(batched_joint_logp, 0, -1)
+
+    sample_graph = Categorical.dist(logit_p=batched_joint_logp)
+    if isinstance(marginalized.owner.op, DiscreteUniform):
+        # rv_domain[0] is folded to a float; adding it directly would insert a
+        # Cast{float64} that breaks logp derivation. Keep the offset integral and
+        # matching the marginalized dtype so the conditional stays loggable.
+        sample_graph += rv_domain[0].astype(marginalized.dtype)
+
+    replacements = dict(zip(op.inner_inputs, inputs))
+    replacements.update(zip(dep_dummies, dep_rvs))
+    [sample_graph] = graph_replace([sample_graph], replace=replacements, strict=False)
+    return sample_graph
+
+
+@node_rewriter(tracks=[MarginalSubgraph])
+def finite_discrete_marginal(fgraph, node):
+    op = node.op
+    n_dep = op.n_dependent_rvs
+
+    inputs, outputs = extract_marginal_subgraph(node)
+    marginalized_rv = outputs[0]
+
+    marginalized_rv_op = marginalized_rv.owner.op
+    if not isinstance(
+        marginalized_rv_op, Bernoulli | Categorical | DiscreteUniform | DiscreteMarkovChain
+    ):
+        return None
+
+    if isinstance(marginalized_rv_op, DiscreteMarkovChain):
+        if marginalized_rv_op.n_lags > 1:
+            raise NotImplementedError(
+                "Marginalization for DiscreteMarkovChain with n_lags > 1 is not supported"
+            )
+        if marginalized_rv.owner.inputs[0].type.ndim > 2:
+            raise NotImplementedError(
+                "Marginalization for DiscreteMarkovChain with non-matrix transition probability "
+                "is not supported"
+            )
+
+    try:
+        dependent_rvs_dim_connections = subgraph_batch_dim_connection(
+            marginalized_rv, outputs[1 : 1 + n_dep]
+        )
+    except (ValueError, NotImplementedError) as e:
+        raise type(e)(
+            "The graph between the marginalized and dependent RVs cannot be marginalized efficiently. "
+            "You can try splitting the marginalized RV into separate components and marginalizing "
+            f"them separately. {e}"
+        ) from e
+
+    if isinstance(marginalized_rv_op, DiscreteMarkovChain):
+        constructor = MarginalDiscreteMarkovChainRV
+    else:
+        constructor = MarginalFiniteDiscreteRV
+
+    typed_op = constructor(
+        inputs=inputs,
+        outputs=outputs,
+        dims_connections=dependent_rvs_dim_connections,
+        marginalized_name=op.marginalized_name,
+        marginalized_dims=op.marginalized_dims,
+        n_dependent_rvs=n_dep,
+    )
+
+    new_outputs = typed_op(*inputs)
+    if not isinstance(new_outputs, list):
+        new_outputs = list(new_outputs)
+    return new_outputs[: len(node.outputs)]
+
+
+marginal_rewrites_db.register("finite_discrete_marginal", finite_discrete_marginal, "basic")

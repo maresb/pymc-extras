@@ -34,11 +34,15 @@ keywords = [
 license = {file = "LICENSE"}
 dynamic = ["version"]  # specify the version in the __init__.py file
 dependencies = [
-  "pymc>=6.0,<7.0",
+  "pymc>=6.0.1,<7.0",
+  "pytensor>=3.0.4",
   "arviz>=1.1",
-  "better-optimize>=0.4.1,<1.0",
+  "better-optimize>=0.4.2,<1.0",
   "pydantic>=2.0.0",
-  "preliz>=0.25.0",
+  "preliz>=0.26.0,<0.27.0",
+  # arviz-plots 1.1.0 imports matplotlib.style.core, which was removed in matplotlib 3.11.
+  # Remove once a fixed arviz-plots is released.
+  "matplotlib<3.11",
 ]
 
 [project.optional-dependencies]
@@ -102,17 +106,8 @@ filterwarnings =[
     # JAX issues an over-eager warning if os.fork() is called when the JAX module is loaded, even if JAX isn't being used
     'ignore:os\.fork\(\) was called\.:RuntimeWarning',
 
-    # Preliz needs to update for pytensor > 2.35
-    'ignore:.*`pytensor\.graph\.basic\.ancestors`.*`pytensor\.graph\.traversal\.ancestors`.*:FutureWarning:^preliz(\.$)',
-
-    # Preliz triggers pytensor broadcastable deprecation internally
-    'ignore:The `broadcastable` keyword is deprecated:DeprecationWarning:pytensor',
-
     # OpenMP library warning on windows CI
     'ignore::RuntimeWarning:threadpoolctl',
-
-    # ArviZ warning related to 1.0 release
-    'ignore:\nArviZ is undergoing a major refactor.*:FutureWarning',
 
     # Numba warnings that are filtered by PyTensor but re-introduced by pytest
     'ignore::numba.core.errors.NumbaPerformanceWarning',
