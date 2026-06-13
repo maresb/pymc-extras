@@ -107,7 +107,9 @@ def _gpd_quantile_from_excess(excess, mu, sigma, xi):
 
 def _gpd_upper_bound(mu, sigma, xi):
     """Right endpoint of the GPD support: ``mu - sigma / xi`` for xi < 0, else +inf."""
-    return pt.switch(pt.lt(xi, 0), mu - sigma / xi, np.inf)
+    has_bounded_support = pt.lt(xi, 0)
+    div_xi = pt.switch(has_bounded_support, xi, 1.0)  # 1.0: arbitrary finite, discarded below
+    return pt.switch(has_bounded_support, mu - sigma / div_xi, np.inf)
 
 
 def _in_gpd_support(z, t):
