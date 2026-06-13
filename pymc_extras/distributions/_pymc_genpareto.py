@@ -249,96 +249,24 @@ class GenPareto(Continuous):
 
 
 class _GPDProbabilityIntegralTransform(Transform):
-    """Default transform for the GPD family: ``y = logit(F(x))``.
+    """Default transform for a latent GPD-family variable: ``y = logit(F(x))``.
 
-    An unobserved (latent) GPD variable lives on a parameter-dependent support --
-    ``[mu, inf)`` for ``xi >= 0`` and the bounded ``[mu, mu - sigma/xi)`` for
-    ``xi < 0`` -- so it needs a transform to an unconstrained space for NUTS.
+    Latent (Ext)GPD support depends on xi (``[mu, inf)`` for ``xi >= 0``, bounded
+    ``[mu, mu - sigma/xi)`` for ``xi < 0``). An ``Interval`` transform's log-Jacobian
+    is discontinuous in xi at 0 -- the upper endpoint ``mu - sigma/xi`` diverges --
+    a kink that with random xi causes divergences (measured 163/1600, vs 3 for this
+    PIT). The family's own CDF makes the transformed prior exactly Logistic,
+    parameter-free and C1, so the kink is gone.
 
-    Rather than an ``Interval`` (whose log-Jacobian is *discontinuous in xi at 0*:
-    the bounded sigmoid map and the one-sided exp map do not connect as the upper
-    endpoint ``mu - sigma/xi`` diverges, putting a ~1e12 gradient kink at xi = 0
-    that triggers divergences when xi is itself random), this uses the
-    probability-integral transform. ``u = F(x)`` is mapped to ``y = logit(u)`` on
-    the whole real line. Because ``F`` is the family's own CDF, the transformed
-    prior density is *exactly Logistic and free of mu/sigma/xi*, so it is C1 in
-    every parameter (no kink anywhere), while the inverse enforces the correct
-    support -- including the moving upper wall -- for all xi.
+    A strict bijection (``forward(backward(y)) == y``) wherever the quantile is
+    float64-representable: all of GenPareto, and ExtGenPareto down to ``kappa ~ 0.1``.
+    For ExtGenPareto ``kappa << 1`` the median lies ``~0.5 ** (1 / kappa)`` below
+    ``mu``, under ``ulp(mu)`` -- a numerical point mass at ``mu`` -- so ``backward``
+    quantizes onto ``mu`` (the float64 limit any x-space transform shares).
+    ``log_jac_det`` is the exact PIT correction, so the sampled density stays exactly
+    Logistic; only the recovered ``x`` pins to ``mu``.
 
-    The map is built in survival / log space so it never materialises a
-    *saturated probability*: ``sigmoid(y)`` rounds to exactly ``1`` for
-    ``y >= 37`` in float64, and feeding that into the quantile gives ``inf`` /
-    ``nan`` on perfectly valid unconstrained values. ``backward`` instead builds
-    the GPD excess ``m = -log(survival)`` directly from ``y`` (``softplus(y)``
-    for the base family), and ``log_jac_det`` uses the analytic
-    ``log F + log S - logp(x)`` rather than autodiffing the quantile graph.
-
-    Bijectivity and the saturated readout. Where the quantile is representable this
-    is an ordinary bijective PIT: ``forward`` and ``backward`` are inverse and
-    ``log_jac_det`` is the true ``log|dx/dy|``. But the quantile is *not* always
-    representable -- the ExtGPD median is sub-ULP from ``mu`` for small ``kappa``,
-    and the heavy/bounded upper tail overflows -- so ``backward`` deliberately
-    *saturates* ``x`` onto the support endpoint there (a ``pt.maximum`` floor at the
-    bottom, overflow / the wall at the top). In that regime the map is no longer
-    invertible: ``forward(backward(y)) != y``, and the saturated ``backward`` has
-    derivative ``0`` (true ``log|dx/dy| = -inf``). ``log_jac_det`` is then *not* the
-    Jacobian of the saturated readout; it is the density correction
-    ``log F + log S - logp(x)`` of the *exact* PIT, so the transformed *density* the
-    sampler targets stays the correct Logistic, while the recovered latent ``x`` is
-    a quantized readout pinned at the boundary. This is the only consistent float64
-    behaviour for a latent whose distribution is (numerically) a point mass at the
-    boundary -- which is exactly what small ``kappa`` / the deep tail means -- but
-    it does mean this is a density-correct reparameterization with a saturated
-    readout there, not a bijection. (Observed data never uses the transform; this
-    affects only a latent variable sampled in that degenerate regime.)
-
-    Range of validity. ``log_jac_det`` computes the Jacobian as ``-softplus(y) -
-    softplus(-y) - logp(backward(y))`` (the first two terms are ``log F + log S``,
-    which the PIT makes the standard Logistic), so the framework's
-    ``logp(backward) + log_jac_det`` cancels to *exactly* Logistic(y) -- finite and
-    correct -- wherever ``x = backward(y)`` is representable with a finite
-    ``logp(x)``. That holds across the whole sampler-reachable range at ordinary
-    scales, including the small-``kappa`` lower tail (``kappa < ~|y| / 745``) where
-    the carrier excess underflows and ``x`` collapses onto ``mu``: ``backward``
-    floors ``x`` just inside the open support (``|mu| * 8 eps`` plus the dtype's
-    smallest normal, ``finfo(dtype).tiny`` -- dtype-aware so it survives float32 and
-    tiny ``sigma``) so the ``kappa < 1`` divergence at ``mu`` does not make
-    ``logp(x) = +inf``.
-
-    Outside that, the transformed logp is robustly ``-inf`` (never ``NaN``, and
-    without relying on the optimizer cancelling the two ``logp`` terms): wherever
-    ``|logp(x)| > 1 / sqrt(eps)`` the cancellation would lose the O(1) Logistic
-    residue, so ``log_jac_det`` returns ``-inf`` directly. Two cases reach that, and
-    *neither is the true Logistic value* -- they are representability limits, not
-    correctness over all of ``R``:
-
-    * The unreachable far upper tail -- the quantile overflows (``xi > 0``,
-      ``y >~ 709 / xi``) or rounds onto the bounded wall, so ``logp(backward) =
-      -inf``. A tail probability of ``~e^-(709/xi)``, never reached.
-    * The degenerate ``sigma << ulp(mu)`` regime (a near-delta with ``mu != 0``):
-      the floor lifts ``x`` to ``z ~ 1 / ulp(mu)``, so ``|logp|`` is enormous and
-      the residue is unrecoverable. Sampling such a near-delta latent is not
-      meaningful; it yields ``-inf`` (a clean reject) rather than a silent wrong
-      value.
-
-    Invalid parameters do not slip through as a valid latent. A non-finite shape
-    (``xi`` or ``kappa``) makes ``logp(x)`` NaN; ``log_jac_det`` returns that NaN
-    through a constant switch branch so the ``logistic - logp(x)`` cancellation
-    cannot turn it back into a finite Logistic, and the transformed logp stays NaN
-    (PyMC's ``check_start_vals`` then rejects it loudly) -- matching ``pm.Gamma`` /
-    ``pm.StudentT`` for a non-finite shape. A non-finite scale (``sigma = inf``) is
-    the degenerate infinite-scale limit and yields ``-inf`` (a clean reject), as
-    ``pm.Normal`` does; ``sigma`` / ``kappa <= 0`` and ``sigma`` / ``kappa = nan``
-    are caught by the wrappers' ``check_parameters``.
-
-    The default starting point is interior and finite-logp: ``support_point``
-    returns the median, or the underlying GPD median when the ExtGPD median rounds
-    onto ``mu`` (the sole exception being the general representability limit where
-    the support has no distinct interior point at all -- ``sigma`` far below
-    ``ulp(mu)``, or a sub-ULP bounded width).
-
-    Subclasses provide the family's ``_logp`` / ``_logcdf`` / ``_logccdf`` and the
-    survival-space ``_excess_from_y``; ``inputs`` are the RV's owner inputs, so
+    Subclasses provide ``_logp`` / ``_logcdf`` / ``_logccdf`` and ``_excess_from_y``;
     ``inputs[2:]`` are the distribution parameters.
     """
 
@@ -366,15 +294,8 @@ class _GPDProbabilityIntegralTransform(Transform):
         params = inputs[2:]
         mu = params[0]
         x = self._quantile_from_excess(self._excess_from_y(value, *params), *params)
-        # Floor x above mu so logp(x) cannot be +inf. Deep in the lower tail the
-        # excess underflows to 0 and x rounds onto mu, where a kappa < 1 ExtGPD
-        # density diverges (logp(mu) = +inf); the framework's logp(backward(y)) would
-        # then be +inf and the transformed logp +inf - inf = NaN. The floor combines
-        # a relative term (|mu| * 8 eps, to clear mu's ULP) and the dtype's smallest
-        # normal (so it does not underflow -- a literal 1e-300 vanishes under float32
-        # and the earlier sigma * 1e-300 under tiny sigma). It only binds once x has
-        # already collapsed onto mu; the transformed logp is handled in log_jac_det,
-        # so the floored value only needs to keep logp(x) finite.
+        # Floor x just above mu: a kappa < 1 density diverges at mu (logp = +inf),
+        # where the deep lower tail rounds x. Dtype-aware for float32 / tiny sigma.
         finfo = np.finfo(value.dtype)
         floor = pt.abs(mu) * (8.0 * finfo.eps) + finfo.tiny
         return pt.maximum(x, mu + floor)
@@ -383,29 +304,19 @@ class _GPDProbabilityIntegralTransform(Transform):
         params = inputs[2:]
         x = self.backward(value, *inputs)
         finfo = np.finfo(value.dtype)
-        # The PIT transformed density is exactly Logistic(value): with F(x) =
-        # sigmoid(value), log f_x(x) + log|dx/dy| = log F + log(1 - F) =
-        # -softplus(value) - softplus(-value). Return that target minus logp(x); the
-        # framework adds logp(backward(value)), so the two logp(x) cancel and the
-        # transformed logp is exactly the Logistic log-density -- for all reachable y.
-        # Where |logp(x)| is so large the cancellation would lose the O(1) Logistic
-        # residue, return -inf instead. That happens only outside the representable
-        # range: the unreachable upper saturation (quantile overflows / hits the wall,
-        # logp = -inf), and the degenerate sigma << ulp(mu) regime where the floored x
-        # sits at z ~ 1/ulp and |logp| ~ 1/(sigma ulp). The threshold 1/sqrt(eps) is
-        # where the cancellation would start losing more than half the digits; no
-        # reachable x at an ordinary scale comes near it (|logp| stays ~|y|).
+        # The PIT makes the transformed density exactly Logistic(value): with F(x) =
+        # sigmoid(value), log f_x(x) + log|dx/dy| = -softplus(value) - softplus(-value).
+        # Return that minus logp(x); the framework adds logp(backward(value)) back, so
+        # the two cancel to the Logistic log-density. Where |logp(x)| is large enough
+        # that the cancellation would lose the O(1) residue (the unreachable upper
+        # saturation, the sigma << ulp(mu) near-delta), return -inf instead.
         logistic = -pt.softplus(value) - pt.softplus(-value)
         logp_x = self._logp(x, *params)
         unrepresentable = pt.abs(logp_x) > 1.0 / np.sqrt(finfo.eps)
         jac = pt.switch(unrepresentable, -np.inf, logistic - logp_x)
-        # A non-finite shape (xi or kappa) makes logp_x NaN. Returning logistic -
-        # logp_x would let that NaN cancel against the framework's + logp(backward) and
-        # resurface as a *finite* Logistic, silently accepting an invalid parameter as a
-        # valid latent. Route it through a switch whose other branch is a bare constant
-        # (no logp_x to cancel), so the transformed logp stays NaN -- matching pm.Gamma
-        # / pm.StudentT, whose transformed latent logp is NaN (caught loudly at
-        # initialization) for a non-finite shape rather than a spurious finite density.
+        # If logp_x is NaN, route through a constant branch so the rewrite optimizer
+        # cannot algebraically cancel this jac's -logp_x against the framework's
+        # +logp(backward) into a spurious finite Logistic.
         return pt.switch(pt.isnan(logp_x), np.nan, jac)
 
 
