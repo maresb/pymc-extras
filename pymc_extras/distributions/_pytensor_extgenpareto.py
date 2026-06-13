@@ -12,14 +12,7 @@
 #   See the License for the specific language governing permissions and
 #   limitations under the License.
 
-"""Extended Generalized Pareto distribution (Naveau et al. 2016 Type 1), in pure
-PyTensor.
-
-Intended for upstreaming to pymc-devs/pytensor-distributions and kept here in that
-project's module shape (``logpdf``/``logcdf``/``logsf``/``cdf``/``pdf``/``sf``/
-``ppf``/``isf``/``rvs``, value argument ``x`` / ``q``) so pymc-extras can swap to a
-``from pytensor_distributions import extgenpareto`` import once it depends on it.
-"""
+"""Extended Generalized Pareto distribution (Naveau et al. 2016 Type 1)."""
 
 import numpy as np
 import pytensor.tensor as pt

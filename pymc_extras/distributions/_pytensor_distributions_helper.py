@@ -14,9 +14,6 @@
 
 """``ppf_bounds_cont`` vendored verbatim from pymc-devs/pytensor-distributions
 (``pytensor_distributions/helper.py``).
-
-Temporary: when pymc-extras depends on pytensor-distributions, delete this module
-and import from ``pytensor_distributions.helper`` instead.
 """
 
 import pytensor.tensor as pt
