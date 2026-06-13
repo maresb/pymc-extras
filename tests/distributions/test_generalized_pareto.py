@@ -399,8 +399,8 @@ class TestExtGenPareto(BaseTestDistributionRandom):
 class TestGenParetoBoundaries:
     """Explicit boundary / invalid-input behaviour for both GPD classes.
 
-    These are exactly the cases an external review found regressing: ``x = inf``,
-    ``q = 0``, ``q = 1`` (with ``xi < 0``), and ``sigma`` / ``kappa`` out of range.
+    Covers ``x = inf``, ``q = 0``, ``q = 1`` (with ``xi < 0``), and ``sigma`` /
+    ``kappa`` out of range.
     """
 
     def test_logp_logcdf_at_infinity(self):
@@ -544,9 +544,8 @@ class TestGenParetoBoundaryPrecision:
     scale like ``z/s`` inherit ``s``'s lost digits and are accurate only to
     ``~ulp/s``. The kappa gradient is exempt (its carrier term has no ``1/s``
     factor). These tests pin that behaviour against a 100-digit decimal reference
-    built from the exact margin, so the limit is documented and regression-guarded.
-    The fix that *recovers* the gradient is a margin-aware entry point (the caller
-    supplies ``s`` without cancellation); see the class docstring note.
+    built from the exact margin. (A caller that forms ``s = 1 + xi*z`` directly,
+    without the cancellation, recovers the gradient.)
     """
 
     def test_boundary_logp_value_holds_but_gradient_tracks_the_margin(self):
@@ -752,7 +751,6 @@ class TestGenParetoTransforms:
                 np.testing.assert_allclose(lp, logistic, atol=1e-3)
 
     def test_small_kappa_collapse_saturates_with_exact_density(self):
-        # Characterize the representability boundary head-on (not select around it).
         # For kappa << 1 the ExtGPD median sits ~0.5 ** (1/kappa) below mu, under
         # ulp(mu), so the whole bulk is a numerical point mass: distinct y all map to
         # the same floored x. The map is therefore NOT injective here -- but the
