@@ -48,26 +48,13 @@ from pymc_extras.distributions._pymc_extgenpareto import _ExtGenParetoPIT
 from pymc_extras.distributions._pytensor_extgenpareto import logpdf as ext_gen_pareto_logp
 from pymc_extras.distributions._pytensor_genpareto import logpdf as gen_pareto_logp
 
-# xi is unconstrained for the GPD family, so its domain carries explicit
-# ``(None, None)`` edges: the harness then runs no "just-outside-the-edge"
-# invalid-xi probe (there is no invalid xi) while still exercising every listed
-# value -- the exponential limit xi = 0 and both tails. Two deliberate bounds on
-# the range:
-#   * strictly > -1: at the closed upper endpoint the open-support convention here
-#     (-inf at the wall) legitimately differs from SciPy -- a measure-zero point --
-#     and for xi < -1 the density there even diverges. ``TestGenParetoBoundaries``
-#     covers the xi < 0 wall directly.
-#   * <= 1: a heavier tail (e.g. xi = 5) pushes the q = 0.99 quantile to ~1e10,
-#     where ``check_icdf``'s *absolute* tolerance fails on a value that is in
-#     fact correct to ~1e-15 relative -- false precision, not a real error.
+# xi is unconstrained, so (None, None) edges skip the harness's invalid-edge probe.
+# Bounded to (-1, 1]: xi <= -1 diverges at the wall (see TestGenParetoBoundaries) and
+# xi > 1 pushes the q=0.99 quantile past check_icdf's absolute tolerance.
 XI_DOMAIN = Domain([-0.9, -0.5, -0.1, 0, 0.1, 0.5, 1], dtype="float64", edges=(None, None))
-# kappa > 0: the trailing inf leaves the upper edge unbounded (no invalid probe
-# above) while the leading 0 lets the harness probe kappa <= 0 (must raise). The
-# inner values are the actual test points.
+# Leading 0 lets the harness probe the invalid kappa <= 0; trailing inf is unbounded.
 KAPPA_DOMAIN = Domain([0, 0.25, 0.5, 1, 2, 5, np.inf], dtype="float64")
-# ``check_icdf`` compares absolute quantile values, so cap sigma to keep the
-# heavy-tail quantiles within tolerance; the leading 0 / trailing inf still let
-# the harness probe sigma <= 0 (must raise). sigma is a pure linear scale.
+# sigma capped so check_icdf's absolute tolerance holds on the heavy-tail quantiles.
 SIGMA_ICDF = Domain([0, 0.1, 0.5, 1.0, 2.0, np.inf], dtype="float64")
 
 
@@ -333,12 +320,10 @@ class TestExtGenParetoClass:
 
     @pytest.mark.parametrize("kappa", [0.5, 0.01])
     def test_small_kappa_inverses_share_the_stable_excess(self, kappa):
-        # icdf, the default transform's backward and support_point all invert the
-        # carrier with the same log1mexp helper, so for small kappa they agree and
-        # stay strictly above mu instead of collapsing onto it. A -log(-expm1(.))
-        # form rounds the tiny GPD survival 1 - q ** (1/kappa) to 1, sending the
-        # excess to 0 -> the lower endpoint -> a -inf initial logp. mu = 0 keeps
-        # the (tiny) median representable; probed where ref_ext_icdf is itself exact.
+        # icdf, the transform's backward, and support_point share one log1mexp carrier
+        # inverse, so for small kappa they agree and stay strictly above mu instead of
+        # collapsing onto it (a -log(-expm1(.)) form would round the tiny survival to 1,
+        # sending the excess to 0 and the initial logp to -inf).
         mu, sigma = 0.0, 1.0
         median = ref_ext_icdf(0.5, mu, sigma, 0.0, kappa)
         assert median > mu
@@ -371,12 +356,9 @@ class TestExtGenParetoClass:
 
     @pytest.mark.parametrize("kappa", [1e-4, 1e-300])
     def test_support_point_falls_back_when_median_collapses(self, kappa):
-        # When kappa is small enough that the ExtGPD median rounds onto mu (which
-        # transforms to a -inf initial point), support_point falls back to the
-        # underlying GPD median (excess = log 2) -- a higher quantile that is
-        # representably interior for any kappa -- so the default initial logp is
-        # finite over the whole kappa > 0 domain. mu = 2 makes even kappa = 1e-4
-        # collapse (the tiny median excess is below ULP(mu)).
+        # When the ExtGPD median rounds onto mu (a -inf initial point), support_point
+        # falls back to the GPD median (excess = log 2), interior for any kappa. mu = 2
+        # makes even kappa = 1e-4 collapse (median excess below ULP(mu)).
         mu, sigma = 2.0, 1.5
         with pm.Model() as model:
             ExtGenPareto("x", mu=mu, sigma=sigma, xi=0.0, kappa=kappa)
@@ -655,10 +637,8 @@ class TestGenParetoTransforms:
             builder("x", **dist_kwargs)
         y = model.value_vars[0]
         logp = pytensor.function([y], model.logp(sum=True))
-        # The integrand is the (smooth, exactly-Logistic) transformed density, so the
-        # error is dominated by the +-30 tail truncation (~2e-13), not the grid
-        # spacing: 2001 points already integrate to ~1e-13, far inside the tolerance,
-        # without evaluating the compiled function tens of thousands of times.
+        # The integrand is the smooth, exactly-Logistic transformed density, so 2001
+        # points over +-30 integrate to ~1e-13 (tail truncation dominates).
         ys = np.linspace(-30, 30, 2001)
         density = np.exp(np.array([float(logp(yi)) for yi in ys]))
         np.testing.assert_allclose(trapezoid(density, ys), 1.0, atol=1e-3)
@@ -666,48 +646,41 @@ class TestGenParetoTransforms:
     @pytest.mark.parametrize(
         "builder, kwargs, ys, roundtrip",
         [
-            # Bounded xi < 0 GPD: guards the y ~ 37 sigmoid-saturation bug (a naive
-            # icdf(sigmoid(y)) returned inf/nan there); round-trips to ~45 (the
-            # bounded-wall CDF, log1mexp near the wall, loses accuracy beyond that).
+            # bounded xi<0: the y~37 sigmoid-saturation point; round-trips to ~45.
             (GenPareto, {"mu": 0.0, "sigma": 1.5, "xi": -0.5}, (-45.0, -37.0, 37.0, 45.0), True),
-            # Unbounded xi = 0 GPD: no wall, exact arbitrarily far out (to y = 1000).
+            # unbounded xi=0: exact arbitrarily far out.
             (GenPareto, {"mu": 0.0, "sigma": 1.0, "xi": 0.0}, (-30.0, 100.0, 1000.0), False),
-            # Heavy xi > 0 GPD: exact below the y ~ 709/xi quantile overflow (400 << 2363).
+            # heavy xi>0: below the y~709/xi quantile overflow.
             (GenPareto, {"mu": 0.0, "sigma": 1.0, "xi": 0.3}, (37.0, 200.0, 400.0), False),
-            # Bounded ExtGPD: the carrier on top of the moving xi < 0 wall.
+            # bounded ExtGPD: carrier on the moving xi<0 wall.
             (
                 ExtGenPareto,
                 {"mu": 0.0, "sigma": 1.0, "xi": -0.3, "kappa": 0.5},
                 (-45.0, -37.0, 37.0, 45.0),
                 True,
             ),
-            # Unbounded ExtGPD deep tail: the y ~ 745 log-F underflow recovered
-            # survival-side (a naive log-F route sent the excess to inf there).
+            # ExtGPD deep tail: the y~745 log-F underflow, recovered survival-side.
             (
                 ExtGenPareto,
                 {"mu": 0.0, "sigma": 1.0, "xi": 0.0, "kappa": 2.0},
                 (-30.0, 100.0, 1000.0),
                 False,
             ),
-            # ExtGPD large kappa: the inverse must depend on kappa (ten orders below).
+            # ExtGPD large kappa: the inverse must depend on kappa.
             (
                 ExtGenPareto,
                 {"mu": 0.0, "sigma": 1.0, "xi": 0.0, "kappa": 1e8},
                 (-30.0, 0.0, 30.0),
                 True,
             ),
-            # ExtGPD kappa < 1: the small-kappa inverse (-log1mexp(log F / kappa)) keeps
-            # a tiny GPD survival from collapsing the excess to 0; still round-trips here.
+            # ExtGPD kappa<1: the small-kappa inverse keeps a tiny survival off 0.
             (
                 ExtGenPareto,
                 {"mu": 0.0, "sigma": 1.0, "xi": 0.0, "kappa": 1e-2},
                 (-5.0, 0.0, 40.0),
                 True,
             ),
-            # ExtGPD collapse (kappa < ~|y|/745): the quantile collapses onto mu, where a
-            # kappa < 1 density diverges (logp = +inf); the transform still returns the
-            # exact finite Logistic, not the +inf - inf = NaN a logcdf+logccdf route gave.
-            # No round-trip there -- the latent readout saturates onto mu.
+            # ExtGPD collapse: quantile collapses onto mu, still exact finite Logistic.
             (
                 ExtGenPareto,
                 {"mu": 2.0, "sigma": 1.0, "xi": 0.0, "kappa": 1e-300},
@@ -753,12 +726,9 @@ class TestGenParetoTransforms:
                 np.testing.assert_allclose(float(forward_backward(y)), y, atol=1e-6)
 
     def test_transformed_logp_robust_in_unoptimized_mode(self):
-        # The transformed logp must not depend on the optimizer cancelling
-        # logp(backward) against log_jac_det. In an unoptimized (fast_compile) graph
-        # the actual numbers are evaluated; the construction must still avoid
-        # +inf - inf = NaN. Over the whole sampler-reachable range, for bounded /
-        # unbounded GPD and small-kappa ExtGPD (lower-tail quantile collapsing onto
-        # mu), the transformed logp is finite and exactly Logistic -- no NaN.
+        # The transformed logp must not rely on the optimizer cancelling logp(backward)
+        # against log_jac_det: in fast_compile the numbers are evaluated, and over the
+        # whole reachable range (incl. the small-kappa collapse) it stays finite Logistic.
         fast = pytensor.compile.mode.Mode(linker="py", optimizer="fast_compile")
         cases = [
             (GenPareto, {"mu": 2.0, "sigma": 1.5, "xi": -0.5}),
