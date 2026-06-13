@@ -139,6 +139,6 @@ def isf(x, mu, sigma, xi, kappa):
 
 def rvs(mu, sigma, xi, kappa, size=None, random_state=None):
     # Inverse-CDF on a carrier draw u = F; excess = -log(1 - u ** (1/kappa)).
-    u = pt.random.uniform(size=size, rng=random_state)
+    u = pt.random.uniform(size=size, rng=random_state, return_next_rng=True)[1]
     excess = _ext_gpd_excess_from_log_prob(pt.log(u), kappa)
     return _gpd_quantile_from_excess(excess, mu, sigma, xi)

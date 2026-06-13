@@ -891,11 +891,10 @@ class TestGenParetoSmoothShapeLimit:
 
 
 class TestPyTensorFunctionalAPI:
-    """The vendored functional API (cdf/pdf/sf/isf + ppf bounds) is self-consistent.
+    """The full functional API (cdf/pdf/sf/isf/rvs + ppf bounds) is self-consistent.
 
-    These wrappers exist for the pytensor-distributions drop-in; pymc-extras itself
-    uses only logpdf/logcdf/logsf/ppf, so this just guards the wrappers from typos.
-    (rvs is not exercised here -- it reuses the same inverse-CDF as the tested RV op.)
+    pymc-extras itself uses only logpdf/logcdf/logsf/ppf; these guard the rest of the
+    surface from typos.
     """
 
     @pytest.mark.parametrize(
@@ -933,3 +932,25 @@ class TestPyTensorFunctionalAPI:
         np.testing.assert_allclose(isf_val, -np.log(x), rtol=1e-12)
         naive = _pytensor_genpareto.ppf(1 - x, 0.0, 1.0, xi).eval()
         assert abs(isf_val[-1] - -np.log(x[-1])) < abs(naive[-1] - -np.log(x[-1]))
+
+    @pytest.mark.parametrize(
+        "module, params",
+        [(_pytensor_genpareto, (0.0, 1.0, 0.2)), (_pytensor_extgenpareto, (0.0, 1.0, 0.2, 1.5))],
+        ids=["genpareto", "extgenpareto"],
+    )
+    def test_rvs_shape_dtype_and_random_state(self, module, params):
+        draws = module.rvs(
+            *params, size=(4, 3), random_state=pytensor.shared(np.random.default_rng(0))
+        )
+        out = draws.eval()
+        assert out.shape == (4, 3) and out.dtype == np.float64
+        assert np.all(out >= 0.0)  # in support (mu = 0)
+        # random_state controls the draws: same seed -> identical, different -> not
+        same = module.rvs(
+            *params, size=(4, 3), random_state=pytensor.shared(np.random.default_rng(0))
+        ).eval()
+        diff = module.rvs(
+            *params, size=(4, 3), random_state=pytensor.shared(np.random.default_rng(9))
+        ).eval()
+        np.testing.assert_array_equal(out, same)
+        assert not np.array_equal(out, diff)

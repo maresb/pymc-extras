@@ -180,5 +180,5 @@ def isf(x, mu, sigma, xi):
 
 def rvs(mu, sigma, xi, size=None, random_state=None):
     # Inverse-CDF on a survival draw: excess = -log(v) avoids the 1 - v cancellation.
-    v = pt.random.uniform(size=size, rng=random_state)
+    v = pt.random.uniform(size=size, rng=random_state, return_next_rng=True)[1]
     return _gpd_quantile_from_excess(-pt.log(v), mu, sigma, xi)
